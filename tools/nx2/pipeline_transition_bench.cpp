@@ -102,7 +102,7 @@ void PrintSamples(std::array<double, 5> samples) {
 } // namespace
 
 int main() {
-    std::cout << "synthetic_key_bytes=" << sizeof(Key)
+    std::cerr << "synthetic_key_bytes=" << sizeof(Key)
               << ",bounded_cache_bytes=" << sizeof(BoundedTransitions) << '\n';
     std::cout << "successors,same_shaders,late_hot,old_median_ns,old_min_ns,old_max_ns,"
                  "bounded_median_ns,bounded_min_ns,bounded_max_ns\n";

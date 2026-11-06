@@ -10,7 +10,7 @@ $repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $build = (Resolve-Path -LiteralPath $BuildDirectory).Path
 $runtime = (Resolve-Path -LiteralPath $RuntimeDirectory).Path
 $binaryDirectory = Join-Path $build 'bin'
-$package = [IO.Path]::GetFullPath($Destination)
+$package = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Destination)
 if (Test-Path -LiteralPath $package) {
     if (Get-ChildItem -LiteralPath $package -Force | Select-Object -First 1) {
         throw "Package destination must be empty: $package"
@@ -35,6 +35,8 @@ foreach ($tool in @($deploy, $objdump)) {
     --no-system-dxc-compiler --no-system-d3d-compiler `
     --dir $package --plugindir (Join-Path $package 'plugins') (Join-Path $package 'lichii.exe')
 if ($LASTEXITCODE -ne 0) { throw 'Qt deployment failed' }
+[IO.File]::WriteAllText((Join-Path $package 'qt.conf'),
+    "[Paths]`nPrefix=.`nPlugins=plugins`n", [Text.UTF8Encoding]::new($false))
 
 # Resolve imports only from this build, its declared runtime and bundled dependencies.
 $search = @($binaryDirectory, $runtime)
@@ -84,4 +86,7 @@ Copy-Item -LiteralPath (Join-Path $repo 'LICENSE.txt') -Destination $package
 Copy-Item -LiteralPath (Join-Path $repo 'LICENSES') -Destination $package -Recurse
 Copy-Item -LiteralPath (Join-Path $repo 'docs\performance-fork.md') -Destination $package
 Copy-Item -LiteralPath (Join-Path $repo 'docs\performance-fork.ru.md') -Destination $package
+New-Item -ItemType Directory -Path (Join-Path $package 'performance') -Force | Out-Null
+Copy-Item -LiteralPath (Join-Path $repo 'docs\performance\pipeline-transition-results.csv') `
+    -Destination (Join-Path $package 'performance')
 Write-Output "Package prepared: $package"

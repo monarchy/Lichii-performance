@@ -78,6 +78,9 @@ Properties on the tested 64-bit build:
 
 - At most 16 successor comparisons, plus the existing self-key comparison.
 - A 136-byte successor-cache object, with no per-transition allocation or full-key copying.
+- The real graphics pipeline key is 1,056 bytes on this ABI, measured with the production
+  compiler flags and headers. Each previous retained edge copied that key plus an 8-byte
+  pointer (1,064 bytes before vector capacity slack and allocator metadata).
 - The previous empty pair of vectors was 48 bytes: empty pipelines therefore cost 88 bytes
   more, while dynamically growing transition-key allocations are eliminated.
 - No shader-cache version change, shader rejection, draw skipping or game-timing patch.
@@ -113,6 +116,7 @@ prefix. That number is not a measured size of the real pipeline key. Hashing and
 lookup use production `Common::CityHash64` and `Common::unordered_map`. Driver work,
 synchronization and the other slow-path bookkeeping are outside the model. Each timed
 sample performs 10,000 lookups; five samples alternate old/new order.
+The benchmark sends size metadata to standard error, leaving standard output as CSV.
 
 Selected medians in nanoseconds per lookup:
 
@@ -159,13 +163,14 @@ is disabled so this experimental executable is not replaced by an unrelated offi
 ```sh
 cmake -S . -B build/performance -G Ninja \
   -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+  -DCMAKE_JOB_POOLS=link_pool=1 -DCMAKE_JOB_POOL_LINK=link_pool \
   -DBUILD_TESTING=ON -DYUZU_TESTS=ON -DDYNARMIC_TESTS=OFF \
   -DENABLE_QT=ON -DYUZU_CMD=ON -DYUZU_ROOM=OFF -DYUZU_ROOM_STANDALONE=OFF \
   -DYUZU_USE_BUNDLED_QT=OFF -DYUZU_USE_BUNDLED_SDL3=ON -DYUZU_USE_BUNDLED_FFMPEG=ON \
   -DVulkanHeaders_FORCE_BUNDLED=ON -DVulkanUtilityLibraries_FORCE_BUNDLED=ON \
   -DENABLE_WEB_SERVICE=ON -DENABLE_LIBUSB=ON -DENABLE_UPDATE_CHECKER=OFF \
   -DENABLE_LTO=OFF -DUSE_DISCORD_PRESENCE=OFF -DYUZU_DISABLE_LLVM=ON
-cmake --build build/performance --target yuzu yuzu-cmd tests --parallel 2
+cmake --build build/performance --target yuzu yuzu-cmd tests --parallel 4
 ```
 
 [package-performance.ps1](../tools/windows/package-performance.ps1) prepares a new package

@@ -142,8 +142,8 @@ public:
         if (key == current_key) {
             return this;
         }
-        return transitions.Find(current_key, [](const GraphicsPipeline* pipeline) -> const auto& {
-            return pipeline->key;
+        return transitions.Find(current_key, [](const GraphicsPipeline* successor) -> const auto& {
+            return successor->key;
         });
     }
 
