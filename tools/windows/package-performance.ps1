@@ -94,4 +94,6 @@ Copy-Item -LiteralPath (Join-Path $repo 'docs\performance-fork.ru.md') -Destinat
 New-Item -ItemType Directory -Path (Join-Path $package 'performance') -Force | Out-Null
 Get-ChildItem -LiteralPath (Join-Path $repo 'docs\performance') -Filter '*.csv' -File |
     Copy-Item -Destination (Join-Path $package 'performance')
+Copy-Item -LiteralPath (Join-Path $repo 'docs\performance\shader-compile.md') `
+    -Destination (Join-Path $package 'performance')
 Write-Output "Package prepared: $package"

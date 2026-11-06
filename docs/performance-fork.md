@@ -315,4 +315,13 @@ After these source changes, all 790 existing test cases passed again (775 main c
 8 update-checker and 7 configuration cases). Six cache/worker cases included in the main
 suite also passed a separate focused repeat; they are not six additional unique cases.
 
+## First-use shader compiler work
+
+SSA definition normalization removes long Identity copy chains; local reads avoid constructing
+a predecessor worklist, and misses reuse its capacity. In a controlled 52-context offline
+comparison, the selected vertex contexts took 76.64% less CFG-through-SPIR-V time; the sum
+across the selected contexts decreased 25.08%. This is CPU compiler work, not a measured game
+FPS increase or proof that NVIDIA driver stalls are fixed. See the
+[method, correctness checks, results and limits](performance/shader-compile.md).
+
 Implementation, investigation, review, tests and this documentation were assisted by OpenAI Codex.
