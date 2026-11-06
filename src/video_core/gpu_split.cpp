@@ -260,7 +260,8 @@ void GpuSplit::Backoff(u32 spins, u64 target) {
         Pause();
         return;
     }
-    if (!back_running.load(std::memory_order_acquire)) {
+    if (!back_running.load(std::memory_order_acquire) ||
+        consumed.load(std::memory_order_acquire) >= target) {
         std::this_thread::yield();
         return;
     }

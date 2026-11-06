@@ -22,6 +22,7 @@
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/pipeline_build.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
+#include "video_core/renderer_vulkan/pipeline_transition_cache.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
@@ -141,9 +142,9 @@ public:
         if (key == current_key) {
             return this;
         }
-        const auto it{std::find(transition_keys.begin(), transition_keys.end(), current_key)};
-        return it != transition_keys.end() ? transitions[std::distance(transition_keys.begin(), it)]
-                                           : nullptr;
+        return transitions.Find(current_key, [](const GraphicsPipeline* pipeline) -> const auto& {
+            return pipeline->key;
+        });
     }
 
     /// The frame the pipeline cache last handed this pipeline out (evicts long unused ones).
@@ -157,8 +158,7 @@ public:
 
     /// Forgets the transitions, which may point to pipelines the cache evicted.
     void ClearTransitions() noexcept {
-        transition_keys.clear();
-        transitions.clear();
+        transitions.Clear();
     }
 
     [[nodiscard]] bool IsBuilt() const noexcept {
@@ -203,8 +203,7 @@ private:
 
     bool (*configure_func)(GraphicsPipeline*, bool){};
 
-    std::vector<GraphicsPipelineCacheKey> transition_keys;
-    std::vector<GraphicsPipeline*> transitions;
+    PipelineTransitionCache<GraphicsPipeline> transitions;
     u64 last_use_frame{};
 
     std::array<vk::ShaderModule, NUM_STAGES> spv_modules;

@@ -60,6 +60,7 @@ add_executable(tests
     video_core/async_shader_emission.cpp
     video_core/pipeline_build.cpp
     video_core/pipeline_optimization.cpp
+    video_core/pipeline_transitions.cpp
     video_core/spirv_atomic_retry.cpp
     video_core/spirv_storage_alignment.cpp
     video_core/spirv_fragment_shuffle.cpp
@@ -67,6 +68,7 @@ add_executable(tests
     video_core/command_fetch_order.cpp
     video_core/command_writer.cpp
     video_core/split_fence_wait.cpp
+    video_core/split_idle_hook.cpp
     video_core/command_snapshot_suspensions.cpp
     video_core/pending_maps.cpp
     video_core/maxwell_fast_method.cpp
