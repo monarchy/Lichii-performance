@@ -91,10 +91,20 @@ Properties on the tested 64-bit build:
 | --- | --- |
 | Focused successor-cache regression suite | Passed: 5 cases, 12,316 assertions |
 | Synthetic lookup benchmark | Completed: five alternating-order repetitions per workload |
-| Real split-worker idle-hook regression | Syntax check passed; runtime check pending full build |
-| Full Windows production build | In progress; not yet claimed successful |
-| Full emulator regression suite | Pending full build |
+| Real split-worker idle-hook regression | Passed: 1 case, 30 assertions; two worker sessions |
+| Windows GUI, CLI and three test targets | Built successfully with Clang 23.1.5 and LLD |
+| Main emulator regression suite | Passed: 775 cases, 69,838,194 assertions |
+| Update-checker regression suite | Passed: 8 cases, 99 assertions |
+| Configuration regression suite | Passed: 7 cases, 426 assertions |
+| Packaged DLL import closure | Passed, including the Qt Windows platform plugin |
+| Isolated packaged CLI `--version` smoke check | Exit code 0 with only Windows system directories on `PATH` |
 | Modified executable in Ocarina gameplay | Not run; the existing game has unsaved progress |
+
+The tested executable was built from commit
+[`0021060964b301fe18cded25491d012531b1c89d`](https://github.com/monarchy/Lichii-performance/commit/0021060964b301fe18cded25491d012531b1c89d).
+The three CTest executables passed in 19.48 seconds. GUI startup, game boot, rendering,
+frame times and save compatibility have not been validated with the modified executable.
+The existing game process remained running throughout the work.
 
 The focused cases exercise full key identity, randomized fallback across overflow and
 clearing, clearing before successor destruction, restoration of full capacity after a
@@ -104,6 +114,18 @@ The integrated `[gpu_split_idle_hook]` case uses the actual split worker, a defe
 and a deliberately blocked idle hook. It checks `Drain()` completion separately from
 `Stop()`, verifies scheduler ownership and repeats a full worker restart. It does not boot
 a game or test the active emulator process.
+
+### Corrections to existing tests
+
+The first full run exposed three failures in existing, unchanged tests. Two compared
+libswscale's row padding: all active Y/UV bytes agreed, while 24 padding bytes differed.
+Scaler tests now compare every active pixel byte, including full/limited/full range changes.
+Strict direct-copy, odd-row, storage-bound and sentinel checks remain unchanged.
+
+The NUP metadata test kept its first reader open across a second archive replacement.
+Windows refused that replacement under the reader's sharing mode. The test now closes the
+reader before editing again. Production video conversion and file-sharing behavior were
+not changed to make these tests pass.
 
 ## Synthetic benchmark
 
@@ -152,31 +174,37 @@ clang++ -std=c++20 -O2 -Wall -Wextra -Isrc \
 ```
 
 MSYS2 appends `.exe` on Windows. For the integrated suite, build the normal `tests` target
-with `YUZU_TESTS=ON`, then run `tests "[pipeline_transitions]"`.
+with `YUZU_TESTS=ON`, then run `tests "[pipeline_transitions],[gpu_split_idle_hook]"`.
+The complete registered suite is run with `ctest --test-dir build/performance --output-on-failure`.
 
 ## Windows build and packaging
 
-The local Windows build uses the MSYS2 UCRT64 Clang toolchain and system Qt. Network services
+The local Windows build uses the MSYS2 UCRT64 Clang toolchain, LLD and system Qt. Network services
 and USB support remain enabled. LTO is off for this validation build. The upstream updater
 is disabled so this experimental executable is not replaced by an unrelated official build.
 
 ```sh
 cmake -S . -B build/performance -G Ninja \
   -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+  -DCMAKE_LINKER_TYPE=LLD \
   -DCMAKE_JOB_POOLS=link_pool=1 -DCMAKE_JOB_POOL_LINK=link_pool \
   -DBUILD_TESTING=ON -DYUZU_TESTS=ON -DDYNARMIC_TESTS=OFF \
   -DENABLE_QT=ON -DYUZU_CMD=ON -DYUZU_ROOM=OFF -DYUZU_ROOM_STANDALONE=OFF \
   -DYUZU_USE_BUNDLED_QT=OFF -DYUZU_USE_BUNDLED_SDL3=ON -DYUZU_USE_BUNDLED_FFMPEG=ON \
   -DVulkanHeaders_FORCE_BUNDLED=ON -DVulkanUtilityLibraries_FORCE_BUNDLED=ON \
   -DENABLE_WEB_SERVICE=ON -DENABLE_LIBUSB=ON -DENABLE_UPDATE_CHECKER=OFF \
+  -DYUZU_USE_BUNDLED_OPENSSL=OFF -DUSE_CCACHE=OFF -DENABLE_WERROR=ON \
   -DENABLE_LTO=OFF -DUSE_DISCORD_PRESENCE=OFF -DYUZU_DISABLE_LLVM=ON
-cmake --build build/performance --target yuzu yuzu-cmd tests --parallel 4
+cmake --build build/performance --target yuzu yuzu-cmd tests config_tests update_checker_tests --parallel 4
+ctest --test-dir build/performance --output-on-failure
 ```
 
-[package-performance.ps1](../tools/windows/package-performance.ps1) prepares a new package
+[package-performance.ps1](https://github.com/monarchy/Lichii-performance/blob/codex/ocarina-performance/tools/windows/package-performance.ps1) prepares a new package
 directory from the built executables, bundled libraries and Qt deployment tools. It checks
 the DLL import closure and copies licenses and these change notes. It requires an empty
 destination and does not copy a `user` directory, saves, keys, games or application logs.
+The MSYS2 runtime's license notices are included when available. A `qt.conf` makes the
+packaged `plugins` directory discoverable without the development toolchain.
 For example, in PowerShell with a UCRT64 toolchain at `C:\msys64`:
 
 ```powershell
