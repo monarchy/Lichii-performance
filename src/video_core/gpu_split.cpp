@@ -147,6 +147,8 @@ void GpuSplit::Stop() {
     front_engine = nullptr;
     back_engine = nullptr;
     front_macros = false;
+    pending_count = 0;
+    pending_engine = nullptr;
     published.store(0, std::memory_order_relaxed);
     consumed.store(0, std::memory_order_relaxed);
     back_waiting.store(false, std::memory_order_relaxed);
@@ -186,7 +188,22 @@ void GpuSplit::WaitForSpace(size_t words) {
     }
 }
 
+void GpuSplit::FlushPending() {
+    const u32 count = pending_count;
+    if (count == 0) {
+        return;
+    }
+    // Adapted from Eglantine PR #503's front CB batching. Keep individual Method entries:
+    // this fork tracks their registers/shadows, which raw CB Multi entries do not preserve.
+    pending_count = 0;
+    SelectEngine(pending_engine);
+    u64* const entry = Reserve(count);
+    std::memcpy(entry, pending_words.data(), count * sizeof(u64));
+    Commit(count);
+}
+
 void GpuSplit::Publish() {
+    FlushPending();
     if (published_local == write_position) {
         return;
     }
@@ -200,6 +217,7 @@ void GpuSplit::Publish() {
 }
 
 void GpuSplit::Drain(DrainSite site) {
+    FlushPending();
     consumed_cache = consumed.load(std::memory_order_acquire);
     if (consumed_cache == write_position && BackQuiet()) {
         return;
@@ -228,10 +246,12 @@ void GpuSplit::Drain(DrainSite site) {
 }
 
 bool GpuSplit::WaitForWriters() {
+    FlushPending();
     return WaitFor(std::min(last_writer_position, write_position), DrainSite::ListWriters);
 }
 
 bool GpuSplit::WaitForSync() {
+    FlushPending();
     return WaitFor(std::min(last_sync_position, write_position), DrainSite::ListSync);
 }
 

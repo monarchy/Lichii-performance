@@ -123,6 +123,17 @@ public:
     }
     void MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
                      u32 amount, u32 methods_pending, const GPUVAddr* segment);
+    /// A macro's CB_DATA word. Preserve its method for shadow tracking and batch only the
+    /// enqueue work; the back's existing constant-buffer handler applies the words in order.
+    void QueueConstBufferWord(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument) {
+        if (pending_count != 0 &&
+            (pending_engine != engine || pending_count == pending_words.size())) {
+            FlushPending();
+        }
+        pending_engine = engine;
+        pending_words[pending_count++] = static_cast<u64>(Kind::Method) | IsLast | Direct |
+                                        (u64{method & 0xffff} << 8) | (u64{argument} << 32);
+    }
     /// A write made by a macro: CallMethod without the method sink, as the engines' macros do.
     void MacroWrite(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument) {
         SelectEngine(engine);
@@ -169,6 +180,7 @@ public:
 
     /// Compute or copy work was just sent: what can write GPU-written command lists.
     void NoteWriter() {
+        FlushPending();
         last_writer_position = write_position;
     }
     /// Waits until the back executed the compute and copy work sent so far (not what came after).
@@ -178,6 +190,7 @@ public:
     /// bit; semaphore acquires drain): the guest's GPU work before it is complete before the
     /// commands after it are fetched.
     void NoteSync() {
+        FlushPending();
         last_sync_position = write_position;
     }
     /// Waits until the back executed the work sent before the last NoteSync. Returns whether any
@@ -210,6 +223,9 @@ private:
 
     /// Room for an entry of `words` at the write position (never across the ring's end).
     u64* Reserve(size_t words) {
+        if (pending_count != 0) {
+            FlushPending();
+        }
         const size_t index = write_position & RingMask;
         if (index + words <= RingWords && write_position + words - consumed_cache <= RingWords)
             [[likely]] {
@@ -225,7 +241,12 @@ private:
         }
     }
     void WaitForSpace(size_t words);
+    void FlushPending();
     void SelectEngine(Tegra::Engines::EngineInterface* engine) {
+        // A pending run selects its own engine before this comparison.
+        if (pending_count != 0) {
+            FlushPending();
+        }
         if (engine != front_engine) [[unlikely]] {
             SwitchEngine(engine);
         }
@@ -261,6 +282,9 @@ private:
     /// Words between publishes: small right after a drain, while the back has nothing to do.
     size_t publish_every{PublishEvery};
     Tegra::Engines::EngineInterface* front_engine{};
+    std::array<u64, 64> pending_words{};
+    u32 pending_count{};
+    Tegra::Engines::EngineInterface* pending_engine{};
 
     // Back side.
     Tegra::Engines::EngineInterface* back_engine{};

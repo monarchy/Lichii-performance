@@ -44,6 +44,14 @@ struct GpuSplitTestAccess {
         return split.write_position;
     }
 
+    static u32 Pending(const GpuSplit& split) {
+        return split.pending_count;
+    }
+
+    static void UseNormalPublication(GpuSplit& split) {
+        split.publish_every = GpuSplit::PublishEvery;
+    }
+
     static void Start(GpuSplit& split, Core::System& system) {
         Initialize(split, system);
         split.active = true;
@@ -453,7 +461,11 @@ TEST_CASE("GpuSplit dispatch preserves mapped uploads and macro boundaries",
                 boundaries.push_back(Access::End(split));
             };
             const auto direct = [&](u32 method, u32 value) {
-                split.MacroWrite(engine, method, value);
+                if (engine == &f.fast && method - CbData < 16) {
+                    split.QueueConstBufferWord(engine, method, value);
+                } else {
+                    split.MacroWrite(engine, method, value);
+                }
                 boundaries.push_back(Access::End(split));
             };
             size_t observed{};
@@ -488,6 +500,11 @@ TEST_CASE("GpuSplit dispatch preserves mapped uploads and macro boundaries",
                 } else {
                     state(CbData + i % 16, 0x56780000 + i);
                 }
+            }
+            inspect();
+            // More than one front batch, retaining each CB_DATA register and its shadow.
+            for (u32 i = 0; i < 137; ++i) {
+                direct(CbData + i % 16, 0x98760000 + i);
             }
             inspect();
             state(ShadowControl, 3);
@@ -653,6 +670,236 @@ TEST_CASE("Maxwell3D fast method dispatch cost", "[.][maxwell_fast_method_bench]
     WARN("Three constant buffer words: " << single_ns << " ns one by one, " << run_ns
                                          << " ns as a run (unmapped buffer)");
 }
+
+TEST_CASE("Front CB batches flush before engine, command and publication boundaries",
+          "[video_core][gpu_split_cb_batch]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    ScopedSystemTestContext context;
+    Core::System system;
+    using Write = std::array<u32, 3>;
+    std::vector<Write> expected, actual;
+    struct Probe final : Tegra::Engines::EngineInterface {
+        u32 id;
+        std::vector<Write>& output;
+        Probe(u32 id_, std::vector<Write>& output_) : id{id_}, output{output_} {
+            execution_mask.set();
+        }
+        void CallMethod(Core::System&, u32 method, u32 value, bool) override {
+            output.push_back({id, method, value});
+        }
+        void CallMultiMethod(Core::System& system_, u32 method, const u32* words, u32 count,
+                             u32) override {
+            for (u32 i = 0; i < count; ++i) {
+                CallMethod(system_, method, words[i], true);
+            }
+        }
+    } first{1, actual}, second{2, actual};
+    VideoCommon::GpuSplit split;
+    // The first batch must wrap as a whole rather than overrun the ring allocation.
+    const u64 start = Access::NearWrap() - 5;
+    Access::Initialize(split, system, start);
+    const auto queue = [&](Probe& engine, u32 count) {
+        for (u32 i = 0; i < count; ++i) {
+            split.QueueConstBufferWord(&engine, CbData + i % 16, i);
+            expected.push_back({engine.id, CbData + i % 16, i});
+        }
+    };
+    queue(first, 137); // capacity flushes
+    queue(second, 3); // pending-engine change
+    split.Method(&first, CbOffset, 12, true, nullptr);
+    expected.push_back({1, CbOffset, 12});
+    queue(first, 2);
+    split.MacroWrite(&first, ShadowControl, 3);
+    expected.push_back({1, ShadowControl, 3});
+    queue(second, 4);
+    const std::array<u32, 2> words{91, 92};
+    split.MultiMethod(&first, CbData, words.data(), 2, 2, nullptr);
+    expected.push_back({1, CbData, 91});
+    expected.push_back({1, CbData, 92});
+    queue(first, 5);
+    split.Defer([&actual] { actual.push_back({0, 0, 99}); });
+    expected.push_back({0, 0, 99});
+    queue(second, 6);
+    split.Publish();
+    REQUIRE(Access::Pending(split) == 0);
+    u64 position = start;
+    while (position < Access::End(split)) {
+        position = Access::Execute(split, position, Access::End(split));
+        REQUIRE(position <= Access::End(split));
+    }
+    REQUIRE(actual == expected);
+}
+
+TEST_CASE("Front constant buffer enqueue cost", "[.][gpu_split_cb_batch_bench]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    constexpr u32 bursts = 1024;
+    constexpr size_t repetitions = 5;
+    // A bounded enqueue-only model: no worker, guest game, driver or memory-bandwidth timing.
+    // Keep the normal publish threshold, but stay well below ring capacity without a consumer.
+    std::vector<std::array<u32, 64>> arguments(bursts);
+    for (u32 burst = 0; burst < bursts; ++burst) {
+        for (u32 word = 0; word < arguments[burst].size(); ++word) {
+            arguments[burst][word] = 0x12340000u ^ (burst * 64 + word);
+        }
+    }
+    for (const u32 words : {2u, 3u, 16u, 64u}) {
+        CAPTURE(words);
+        std::array<std::array<double, repetitions>, 2> samples{};
+        for (size_t repetition = 0; repetition < repetitions; ++repetition) {
+            for (size_t order = 0; order < 2; ++order) {
+                const bool queued = ((repetition + order) & 1) != 0;
+                auto& engine = queued ? f.fast : f.slow;
+                engine.CallMethod(f.system, ShadowControl, 0, true);
+                VideoCommon::GpuSplit split;
+                Access::Initialize(split, f.system);
+                Access::UseNormalPublication(split);
+                // Offset and following executable state write delimit each realistic CB run.
+                const auto start = std::chrono::steady_clock::now();
+                for (u32 burst = 0; burst < bursts; ++burst) {
+                    split.MacroWrite(&engine, CbOffset, 0x640);
+                    for (u32 word = 0; word < words; ++word) {
+                        if (queued) {
+                            split.QueueConstBufferWord(&engine, CbData + word % 16,
+                                                       arguments[burst][word]);
+                        } else {
+                            split.MacroWrite(&engine, CbData + word % 16,
+                                             arguments[burst][word]);
+                        }
+                    }
+                    split.MacroWrite(&engine, MAXWELL3D_REG_INDEX(vertex_buffer.first), burst);
+                }
+                split.Publish();
+                samples[queued ? 1 : 0][repetition] =
+                    std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() -
+                                                           start)
+                        .count() /
+                    bursts;
+
+                // Execute and verify separately: the timed regions only produce commands.
+                REQUIRE(Access::Pending(split) == 0);
+                u64 position{};
+                while (position < Access::End(split)) {
+                    position = Access::Execute(split, position, Access::End(split));
+                }
+                REQUIRE(position == Access::End(split));
+                REQUIRE(engine.regs.const_buffer.offset == 0x640 + words * sizeof(u32));
+                REQUIRE(engine.GetRegisterValue(CbData + (words - 1) % 16) ==
+                        arguments.back()[words - 1]);
+            }
+            f.Compare();
+        }
+        for (auto& sample : samples) {
+            std::sort(sample.begin(), sample.end());
+        }
+        WARN(words << " CB words per burst: MacroWrite median " << samples[0][2] << " ns ("
+                   << samples[0].front() << ".." << samples[0].back() << "), queued median "
+                   << samples[1][2] << " ns (" << samples[1].front() << ".." << samples[1].back()
+                   << "); five alternating-order repetitions, enqueue only");
+    }
+}
+
+TEST_CASE("Front CB batches participate in waits and reset across split sessions",
+          "[video_core][gpu_split_cb_batch]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    f.system.Initialize();
+    VideoCommon::GpuSplit split;
+    for (u32 session = 0; session < 2; ++session) {
+        Access::Start(split, f.system);
+        SCOPE_EXIT { split.Stop(); };
+        REQUIRE(Access::Pending(split) == 0);
+        split.QueueConstBufferWord(&f.fast, CbData, 10 + session);
+        split.NoteWriter();
+        split.WaitForWriters();
+        REQUIRE(f.fast.regs.const_buffer.buffer[0] == 10 + session);
+        split.QueueConstBufferWord(&f.fast, CbData + 1, 20 + session);
+        split.NoteSync();
+        split.WaitForSync();
+        REQUIRE(f.fast.regs.const_buffer.buffer[1] == 20 + session);
+        split.QueueConstBufferWord(&f.fast, CbData + 2, 30 + session);
+        split.Drain();
+        REQUIRE(f.fast.regs.const_buffer.buffer[2] == 30 + session);
+        // Even an already-satisfied writer/sync wait must flush a pending later run.
+        split.QueueConstBufferWord(&f.fast, CbData + 3, 40 + session);
+        split.WaitForWriters();
+        REQUIRE(Access::Pending(split) == 0);
+        split.QueueConstBufferWord(&f.fast, CbData + 4, 50 + session);
+        split.WaitForSync();
+        REQUIRE(Access::Pending(split) == 0);
+        split.Drain();
+        REQUIRE(f.fast.regs.const_buffer.buffer[3] == 40 + session);
+        REQUIRE(f.fast.regs.const_buffer.buffer[4] == 50 + session);
+        split.QueueConstBufferWord(&f.fast, CbData + 5, 0xdeadbeef);
+        REQUIRE(Access::Pending(split) == 1);
+        split.Stop();
+        REQUIRE(Access::Pending(split) == 0);
+        REQUIRE(f.fast.regs.const_buffer.buffer[5] != 0xdeadbeef);
+    }
+}
+
+#ifdef ARCHITECTURE_x86_64
+TEST_CASE("Front macros retain tracked CB values for later shadow Replay",
+          "[video_core][gpu_split_cb_batch][native_macro]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    VideoCommon::GpuSplit split;
+    Access::Initialize(split, f.system);
+    f.fast.SetNativeTuringMacroMode(true);
+    auto& macro = f.fast.GetNativeMacroEngine();
+    // Three FIFO emits, with the final one in the end instruction's delay slot.
+    for (u32 i = 0; i < 3; ++i) {
+        std::array<u32, 3> bits{};
+        const auto field = [&](u32 offset, u32 count, u32 value) {
+            for (u32 bit = 0; bit < count; ++bit) {
+                bits[(offset + bit) / 32] |= ((value >> bit) & 1) << ((offset + bit) % 32);
+            }
+        };
+        field(0, 1, i == 1);
+        for (u32 lane = 0; lane < 2; ++lane) {
+            field(15 + lane * 36, 5, 24);
+            field(20 + lane * 36, 5, 24);
+            field(25 + lane * 36, 5, 24);
+        }
+        field(30, 16, CbData + i);
+        field(82, 3, 5);
+        field(85, 4, 3);
+        for (const u32 word : {bits[2], bits[1], bits[0]}) {
+            macro.AddCode(0, word);
+        }
+    }
+    u64 position{};
+    const auto execute = [&] {
+        split.Publish();
+        while (position < Access::End(split)) {
+            position = Access::Execute(split, position, Access::End(split));
+        }
+        REQUIRE_FALSE(macro.native_execution_failed);
+        REQUIRE(f.fast.regs.reg_array == f.slow.regs.reg_array);
+        REQUIRE(f.fast.shadow_state.reg_array == f.slow.shadow_state.reg_array);
+        REQUIRE(f.fast.dirty.flags == f.slow.dirty.flags);
+    };
+    const auto invoke = [&](u32 first) {
+        const std::array<u32, 3> arguments{first, first + 1, first + 2};
+        for (u32 i = 0; i < 3; ++i) {
+            f.slow.CallMethod(f.system, CbData + i, arguments[i], true);
+        }
+        f.fast.FrontCallMultiMethod(f.system, split, 0xe00, arguments.data(), 3, 3);
+    };
+    invoke(10); // first macro also finishes the initial deferred-draw state
+    execute();
+    invoke(20);
+    REQUIRE(Access::Pending(split) == 3);
+    execute();
+    for (const u32 mode : {1u, 3u, 2u, 0u}) { // track/filter, Replay, passthrough, track
+        f.slow.CallMethod(f.system, ShadowControl, mode, true);
+        f.fast.FrontCallMethod(f.system, split, ShadowControl, mode, true);
+        invoke(100 + mode * 10);
+        REQUIRE(Access::Pending(split) == (mode == 3 ? 0 : 3));
+        execute();
+    }
+}
+#endif
 
 TEST_CASE("Full split drains preserve aliased uploads, partial coverage and queued remaps",
           "[video_core][gpu_split_dependencies]") {

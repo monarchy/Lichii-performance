@@ -1179,7 +1179,12 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
         }
     }
     if (from_macro) {
-        split.MacroWrite(this, method, argument);
+        constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
+        if (method - cb_data < 16 && fs.control != Regs::ShadowRamControl::Replay) {
+            split.QueueConstBufferWord(this, method, argument);
+        } else {
+            split.MacroWrite(this, method, argument);
+        }
     } else {
         split.Method(this, method, argument, is_last_call, nullptr);
     }
