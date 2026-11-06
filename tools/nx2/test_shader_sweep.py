@@ -16,6 +16,8 @@ def environment(version, stage):
     header = struct.pack("<" + "Q" * len(counts) + "7I", *counts, 0, 2, 0, 0, 80, 1, stage)
     context = bytes(8 + 8 + 12 + (9 if version >= 47 else 0) + 12)
     tail = bytes(16 if stage == 5 else 80 + (32 if stage == 3 else 0))
+    if version == 53 and stage in (7, 8):
+        tail += bytes(12 + 80)
     return header + code + context + tail
 
 
@@ -29,14 +31,26 @@ def pipeline_cache(version):
 
 
 class CacheTests(unittest.TestCase):
-    def test_both_versions_preserve_records_and_stage(self):
-        for version in (46, 47, 48, 49, 50):
+    def test_supported_versions_preserve_records_and_stage(self):
+        for version in (46, 47, 48, 49, 50, 53):
             records = list(sweep.parse_cache(pipeline_cache(version)))
             self.assertEqual([r["stage"] for r in records], ["vertex", "geometry", "fragment", "compute"])
             for record, stage in zip(records, (0, 3, 4, 5)):
                 self.assertEqual(record["bytes"], environment(version, stage))
                 self.assertEqual(record["version"], version)
                 self.assertEqual(len(record["key"]), 24 if stage == 5 else 1056)
+
+    def test_v53_task_mesh_context_keeps_the_following_key_aligned(self):
+        data = b"yuzucach" + struct.pack("<II", 53, 2)
+        data += environment(53, 7) + environment(53, 8)
+        key = bytes(range(256)) * 4 + bytes(32)
+        records = list(sweep.parse_cache(data + key))
+        self.assertEqual([r["stage"] for r in records], ["task", "mesh"])
+        for record, stage in zip(records, (7, 8)):
+            self.assertEqual(record["bytes"], environment(53, stage))
+            self.assertEqual(record["key"], key)
+        with self.assertRaises(sweep.CacheError):
+            list(sweep.parse_cache((data + key)[:-1]))
 
     def test_truncation_is_not_an_empty_success(self):
         data = pipeline_cache(47)

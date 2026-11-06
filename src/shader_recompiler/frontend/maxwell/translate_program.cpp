@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <bitset>
+#include <chrono>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -357,125 +358,163 @@ void TightenOutputVertices(IR::Program& program) {
 } // Anonymous namespace
 
 IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Block>& block_pool,
-                             Environment& env, Flow::CFG& cfg, const HostTranslateInfo& host_info) {
+                             Environment& env, Flow::CFG& cfg, const HostTranslateInfo& host_info,
+                             TranslationTimings* timings) {
+    using Clock = std::chrono::steady_clock;
+    const auto begin = timings ? Clock::now() : Clock::time_point{};
+    if (timings) {
+        *timings = {};
+    }
+    const auto measure = [timings](TranslationPass pass, auto&& function) {
+        if (!timings) {
+            function();
+            return;
+        }
+        const auto pass_begin = Clock::now();
+        function();
+        timings->milliseconds[static_cast<size_t>(pass)] =
+            std::chrono::duration<double, std::milli>(Clock::now() - pass_begin).count();
+    };
     HostTranslateInfo normalized_host_info{host_info};
-    normalized_host_info.ApplyDescriptorLimitPolicy();
+    measure(TranslationPass::HostSetup, [&] {
+        normalized_host_info.ApplyDescriptorLimitPolicy();
+    });
 
     IR::Program program;
-    program.syntax_list = BuildASL(inst_pool, block_pool, env, cfg, normalized_host_info);
-    program.blocks = GenerateBlocks(program.syntax_list);
-    program.post_order_blocks = PostOrder(program.syntax_list.front());
-    program.stage = env.ShaderStage();
-    program.local_memory_size = env.LocalMemorySize();
-    switch (program.stage) {
-    case Stage::TessellationControl: {
-        const ProgramHeader& sph{env.SPH()};
-        program.invocations = sph.common2.threads_per_input_primitive;
-        break;
-    }
-    case Stage::Geometry: {
-        const ProgramHeader& sph{env.SPH()};
-        program.output_topology = sph.common3.output_topology;
-        program.output_vertices = sph.common4.max_output_vertices;
-        program.invocations = sph.common2.threads_per_input_primitive;
-        program.is_geometry_passthrough = sph.common0.geometry_passthrough != 0;
-        if (program.is_geometry_passthrough) {
-            const auto& mask{env.GpPassthroughMask()};
-            for (size_t i = 0; i < mask.size() * 32; ++i) {
-                program.info.passthrough.mask[i] = ((mask[i / 32] >> (i % 32)) & 1) == 0;
-            }
+    measure(TranslationPass::ASL, [&] {
+        program.syntax_list = BuildASL(inst_pool, block_pool, env, cfg, normalized_host_info);
+    });
+    measure(TranslationPass::Blocks, [&] { program.blocks = GenerateBlocks(program.syntax_list); });
+    measure(TranslationPass::PostOrder, [&] {
+        program.post_order_blocks = PostOrder(program.syntax_list.front());
+    });
+    measure(TranslationPass::ProgramMetadata, [&] {
+        program.stage = env.ShaderStage();
+        program.local_memory_size = env.LocalMemorySize();
+        switch (program.stage) {
+        case Stage::TessellationControl: {
+            const ProgramHeader& sph{env.SPH()};
+            program.invocations = sph.common2.threads_per_input_primitive;
+            break;
+        }
+        case Stage::Geometry: {
+            const ProgramHeader& sph{env.SPH()};
+            program.output_topology = sph.common3.output_topology;
+            program.output_vertices = sph.common4.max_output_vertices;
+            program.invocations = sph.common2.threads_per_input_primitive;
+            program.is_geometry_passthrough = sph.common0.geometry_passthrough != 0;
+            if (program.is_geometry_passthrough) {
+                const auto& mask{env.GpPassthroughMask()};
+                for (size_t i = 0; i < mask.size() * 32; ++i) {
+                    program.info.passthrough.mask[i] = ((mask[i / 32] >> (i % 32)) & 1) == 0;
+                }
 
-            if (!normalized_host_info.support_geometry_shader_passthrough) {
-                program.output_vertices = GetOutputTopologyVertices(program.output_topology);
-                LowerGeometryPassthrough(program, normalized_host_info);
+                if (!normalized_host_info.support_geometry_shader_passthrough) {
+                    program.output_vertices = GetOutputTopologyVertices(program.output_topology);
+                    LowerGeometryPassthrough(program, normalized_host_info);
+                }
             }
+            break;
         }
-        break;
-    }
-    case Stage::Compute:
-        program.workgroup_size = env.WorkgroupSize();
-        program.shared_memory_size = env.SharedMemorySize();
-        break;
-    case Stage::Task:
-    case Stage::Mesh: {
-        // SET_MESH_SHADER_A: topology 3:0, max vertex 12:4, max primitive 22:13;
-        // SET_MESH_SHADER_B: mesh threads 25:20; SET_MESH_INIT_SHADER: task threads 5:0, local
-        // buffer lines 20:12, lines passed to the mesh stage 30:22 (lines are 128 bytes).
-        const auto& registers{env.MeshRegisters()};
-        const u32 shader_a{registers[0]}, shader_b{registers[1]}, init{registers[2]};
-        const u32 lines{(std::max)((init >> 12) & 0x1ff, (init >> 22) & 0x1ff)};
-        program.mesh.payload_words = (std::max)(lines, 1U) * 32;
-        program.mesh.topology = shader_a & 0xf;
-        program.mesh.max_vertices = (shader_a >> 4) & 0x1ff;
-        program.mesh.max_primitives = (shader_a >> 13) & 0x3ff;
-        const u32 threads{program.stage == Stage::Task ? init & 0x3f : (shader_b >> 20) & 0x3f};
-        program.workgroup_size = {(std::max)(threads, 1U), 1, 1};
-        if (program.stage == Stage::Mesh) {
-            if (program.mesh.topology != 4) {
-                throw NotImplementedException("Mesh output topology {} (SET_MESH_SHADER_A {:#010x})",
-                                              program.mesh.topology, shader_a);
+        case Stage::Compute:
+            program.workgroup_size = env.WorkgroupSize();
+            program.shared_memory_size = env.SharedMemorySize();
+            break;
+        case Stage::Task:
+        case Stage::Mesh: {
+            // SET_MESH_SHADER_A: topology 3:0, max vertex 12:4, max primitive 22:13;
+            // SET_MESH_SHADER_B: mesh threads 25:20; SET_MESH_INIT_SHADER: task threads 5:0, local
+            // buffer lines 20:12, lines passed to the mesh stage 30:22 (lines are 128 bytes).
+            const auto& registers{env.MeshRegisters()};
+            const u32 shader_a{registers[0]}, shader_b{registers[1]}, init{registers[2]};
+            const u32 lines{(std::max)((init >> 12) & 0x1ff, (init >> 22) & 0x1ff)};
+            program.mesh.payload_words = (std::max)(lines, 1U) * 32;
+            program.mesh.topology = shader_a & 0xf;
+            program.mesh.max_vertices = (shader_a >> 4) & 0x1ff;
+            program.mesh.max_primitives = (shader_a >> 13) & 0x3ff;
+            const u32 threads{program.stage == Stage::Task ? init & 0x3f : (shader_b >> 20) & 0x3f};
+            program.workgroup_size = {(std::max)(threads, 1U), 1, 1};
+            if (program.stage == Stage::Mesh) {
+                if (program.mesh.topology != 4) {
+                    throw NotImplementedException("Mesh output topology {} (SET_MESH_SHADER_A {:#010x})",
+                                                  program.mesh.topology, shader_a);
+                }
+                AddMeshLines(env.SPH(), program.mesh.vertex_lines);
+                AddMeshLines(env.MeshPrimitiveHeader(), program.mesh.primitive_lines);
             }
-            AddMeshLines(env.SPH(), program.mesh.vertex_lines);
-            AddMeshLines(env.MeshPrimitiveHeader(), program.mesh.primitive_lines);
+            break;
         }
-        break;
-    }
-    default:
-        break;
-    }
-    RemoveUnreachableBlocks(program);
+        default:
+            break;
+        }
+    });
+    measure(TranslationPass::RemoveUnreachable, [&] { RemoveUnreachableBlocks(program); });
 
     // Replace instructions before the SSA rewrite
     if (!normalized_host_info.support_float64) {
-        Optimization::LowerFp64ToFp32(program);
+        measure(TranslationPass::LowerFp64, [&] { Optimization::LowerFp64ToFp32(program); });
     }
     if (!normalized_host_info.support_float16) {
-        Optimization::LowerFp16ToFp32(program);
+        measure(TranslationPass::LowerFp16, [&] { Optimization::LowerFp16ToFp32(program); });
     }
     if (!normalized_host_info.support_int64) {
-        Optimization::LowerInt64ToInt32(program);
+        measure(TranslationPass::LowerInt64, [&] { Optimization::LowerInt64ToInt32(program); });
     }
     if (!normalized_host_info.support_conditional_barrier) {
-        Optimization::ConditionalBarrierPass(program);
+        measure(TranslationPass::ConditionalBarrier,
+                [&] { Optimization::ConditionalBarrierPass(program); });
     }
-    Optimization::SsaRewritePass(program);
+    measure(TranslationPass::SSA, [&] { Optimization::SsaRewritePass(program); });
 
-    Optimization::ConstantPropagationPass(env, program);
+    measure(TranslationPass::ConstantPropagation,
+            [&] { Optimization::ConstantPropagationPass(env, program); });
 
-    Optimization::PositionPass(env, program);
-    Optimization::BlitConstantsPass(env, program);
+    measure(TranslationPass::Position, [&] { Optimization::PositionPass(env, program); });
+    measure(TranslationPass::BlitConstants, [&] { Optimization::BlitConstantsPass(env, program); });
 
-    Optimization::GlobalMemoryToStorageBufferPass(env, program, normalized_host_info);
-    Optimization::GeometryCompactionPass(program, normalized_host_info);
-    Optimization::TexturePass(env, program, normalized_host_info);
+    measure(TranslationPass::GlobalMemory, [&] {
+        Optimization::GlobalMemoryToStorageBufferPass(env, program, normalized_host_info);
+    });
+    measure(TranslationPass::GeometryCompaction,
+            [&] { Optimization::GeometryCompactionPass(program, normalized_host_info); });
+    measure(TranslationPass::Texture,
+            [&] { Optimization::TexturePass(env, program, normalized_host_info); });
 
     if (Settings::values.resolution_info.active) {
-        Optimization::RescalingPass(program);
+        measure(TranslationPass::Rescaling, [&] { Optimization::RescalingPass(program); });
     }
-    Optimization::DeadCodeEliminationPass(program);
-    TightenOutputVertices(program);
+    measure(TranslationPass::DeadCodeElimination,
+            [&] { Optimization::DeadCodeEliminationPass(program); });
+    measure(TranslationPass::TightenOutputVertices, [&] { TightenOutputVertices(program); });
     if (Settings::values.renderer_debug) {
-        Optimization::VerificationPass(program);
+        measure(TranslationPass::Verification, [&] { Optimization::VerificationPass(program); });
     }
-    Optimization::CollectShaderInfoPass(env, program);
-    program.info.is_task = program.stage == Stage::Task;
-    program.info.is_mesh = program.stage == Stage::Mesh;
-    if (program.stage == Stage::Mesh) {
-        // Its outputs come from the stage buffer lines, not attribute stores; the next stage
-        // reads what they name.
-        for (const u32 line : program.mesh.vertex_lines) {
-            program.info.stores.Set(static_cast<IR::Attribute>(line), true);
+    measure(TranslationPass::CollectShaderInfo,
+            [&] { Optimization::CollectShaderInfoPass(env, program); });
+    measure(TranslationPass::MeshInfo, [&] {
+        program.info.is_task = program.stage == Stage::Task;
+        program.info.is_mesh = program.stage == Stage::Mesh;
+        if (program.stage == Stage::Mesh) {
+            // Its outputs come from the stage buffer lines, not attribute stores; the next stage
+            // reads what they name.
+            for (const u32 line : program.mesh.vertex_lines) {
+                program.info.stores.Set(static_cast<IR::Attribute>(line), true);
+            }
+            for (const u32 line : program.mesh.primitive_lines) {
+                program.info.stores.Set(static_cast<IR::Attribute>(line), true);
+            }
         }
-        for (const u32 line : program.mesh.primitive_lines) {
-            program.info.stores.Set(static_cast<IR::Attribute>(line), true);
-        }
-    }
-    Optimization::LayerPass(program, normalized_host_info);
-    Optimization::VendorWorkaroundPass(program);
+    });
+    measure(TranslationPass::Layer, [&] { Optimization::LayerPass(program, normalized_host_info); });
+    measure(TranslationPass::VendorWorkaround, [&] { Optimization::VendorWorkaroundPass(program); });
 
-    CollectInterpolationInfo(env, program);
-    AddNVNStorageBuffers(program);
-    Optimization::LimitSampledTextureArrays(program, normalized_host_info);
+    measure(TranslationPass::InterpolationInfo, [&] { CollectInterpolationInfo(env, program); });
+    measure(TranslationPass::NVNStorageBuffers, [&] { AddNVNStorageBuffers(program); });
+    measure(TranslationPass::LimitSampledTextureArrays,
+            [&] { Optimization::LimitSampledTextureArrays(program, normalized_host_info); });
+    if (timings) {
+        timings->total_ms = std::chrono::duration<double, std::milli>(Clock::now() - begin).count();
+    }
     return program;
 }
 

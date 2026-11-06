@@ -2,6 +2,7 @@
 
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -44,6 +45,10 @@ Stage ParseStage(std::string_view name) {
         if (name == StageNames[i])
             return static_cast<Stage>(i);
     }
+    if (name == "task")
+        return Stage::Task;
+    if (name == "mesh")
+        return Stage::Mesh;
     throw std::runtime_error("Unknown stage: " + std::string{name});
 }
 
@@ -182,6 +187,10 @@ public:
             sph = reader.Read<Shader::ProgramHeader>();
             if (stage == Stage::Geometry)
                 gp_passthrough_mask = reader.Read<std::array<u32, 8>>();
+            if (version >= 53 && (stage == Stage::Task || stage == Stage::Mesh)) {
+                mesh_registers = reader.Read<std::array<u32, 3>>();
+                mesh_primitive_header = reader.Read<Shader::ProgramHeader>();
+            }
         }
         if (reader.Remaining())
             throw std::runtime_error("Trailing bytes after environment record");
@@ -399,6 +408,8 @@ Shader::RuntimeInfo Runtime(std::span<const u8> key, Stage stage, Json& assumpti
     }
     info.force_early_z = (raw2 >> 4) & 1;
     info.y_negate = (raw2 >> 11) & 1;
+    if (stage == Stage::Mesh)
+        info.convert_depth_mode = (raw1 >> 7) & 1;
     if (stage == Stage::Geometry || (stage == Stage::VertexB && word(32) == 0 && word(36) == 0)) {
         info.convert_depth_mode = (raw1 >> 7) & 1;
         if (topology == 0)
@@ -533,15 +544,18 @@ int main(int argc, char** argv) {
         u32 version{};
         bool lower_only{};
         bool capture_extent{};
+        bool timings_enabled{};
+        u32 iterations{1};
         for (int i = 1; i < argc; ++i) {
             const std::string arg{argv[i]};
             if (arg == "--help") {
                 std::cout << "shader-sweep [INPUT] [--stage "
-                             "vertex|tess-control|tess-eval|geometry|fragment|compute]\n"
+                             "vertex|tess-control|tess-eval|geometry|fragment|compute|task|mesh]\n"
                              "  [--format instructions|native-header] [--environment FILE "
-                             "--cache-version 46|47|48|49|50|51|52]\n"
+                             "--cache-version 46|47|48|49|50|51|52|53]\n"
                              "  [--pipeline-key FILE] [--capture-extent] "
-                             "(--output SPV | --lower-only WORDS)\n";
+                             "(--output SPV | --lower-only WORDS)\n"
+                             "  [--timings [--iterations 1..1000]]\n";
                 return 0;
             }
             if (!arg.starts_with("--")) {
@@ -552,6 +566,10 @@ int main(int argc, char** argv) {
             }
             if (arg == "--capture-extent") {
                 capture_extent = true;
+                continue;
+            }
+            if (arg == "--timings") {
+                timings_enabled = true;
                 continue;
             }
             if (++i == argc)
@@ -567,9 +585,17 @@ int main(int argc, char** argv) {
                 pipeline_key = value;
             else if (arg == "--cache-version") {
                 if (value != "46" && value != "47" && value != "48" && value != "49" && value != "50" &&
-                    value != "51" && value != "52")
-                    throw std::runtime_error("Expected cache version 46 to 52");
+                    value != "51" && value != "52" && value != "53")
+                    throw std::runtime_error("Expected cache version 46 to 53");
                 version = static_cast<u32>(std::stoul(value));
+            } else if (arg == "--iterations") {
+                if (value.empty() || value.size() > 4 ||
+                    value.find_first_not_of("0123456789") != std::string::npos) {
+                    throw std::runtime_error("Expected iteration count 1 to 1000");
+                }
+                iterations = static_cast<u32>(std::stoul(value));
+                if (iterations == 0 || iterations > 1000)
+                    throw std::runtime_error("Expected iteration count 1 to 1000");
             } else if (arg == "--output" || arg == "--lower-only") {
                 if (!output.empty())
                     throw std::runtime_error("Only one output mode is permitted");
@@ -580,7 +606,8 @@ int main(int argc, char** argv) {
         }
         if (output.empty() || (input.empty() && environment.empty()) ||
             (environment.empty() != (version == 0)) || (lower_only && input.empty()) ||
-            (capture_extent && input.empty())) {
+            (capture_extent && input.empty()) || (iterations != 1 && !timings_enabled) ||
+            (lower_only && timings_enabled)) {
             throw std::runtime_error("Invalid arguments; see --help");
         }
         if (format != "instructions" && format != "native-header")
@@ -708,21 +735,22 @@ int main(int argc, char** argv) {
             }
         }
         diagnostic["stage"] = StageNames[static_cast<u32>(env.ShaderStage())];
-        if (env.ShaderStage() == Stage::Task || env.ShaderStage() == Stage::Mesh ||
-            env.ShaderStage() == Stage::VertexA) {
-            throw MissingContext(
-                "Task, mesh and vertex-A require additional pipeline stage context");
+        if (env.ShaderStage() == Stage::VertexA) {
+            throw MissingContext("Vertex-A requires additional pipeline stage context");
+        }
+        if (env.ShaderStage() == Stage::Task || env.ShaderStage() == Stage::Mesh) {
+            if (!env.captured || version < 53) {
+                throw MissingContext("Task and mesh require a captured v53 environment");
+            }
+            diagnostic["assumptions"].push_back(
+                "Isolated task/mesh stage uses captured mesh registers and primitive header; "
+                "SPV_EXT_mesh_shader is assumed, sibling payload/output linkage is not validated");
         }
         const auto key = pipeline_key.empty() ? std::vector<u8>{} : ReadFile(pipeline_key);
         auto runtime = Runtime(key, env.ShaderStage(), diagnostic["assumptions"]);
         diagnostic["assumptions"].push_back(
             "Offline SPIR-V 1.4 profile; no device feature probing, default shader settings, no "
             "resolution scaling");
-        diagnostic["phase"] = "translate";
-        Shader::ObjectPool<Shader::Maxwell::Flow::Block> flow_pool;
-        Shader::Maxwell::Flow::CFG cfg{env, flow_pool, Shader::Maxwell::Location{env.EntryPoint()}};
-        Shader::ObjectPool<Shader::IR::Inst> inst_pool;
-        Shader::ObjectPool<Shader::IR::Block> block_pool;
         Shader::HostTranslateInfo host{};
         host.support_float64 = true;
         host.support_float16 = true;
@@ -731,9 +759,6 @@ int main(int argc, char** argv) {
         host.support_viewport_index_layer = true;
         host.support_geometry_shader_passthrough = true;
         host.ApplyDescriptorLimitPolicy();
-        auto program = Shader::Maxwell::TranslateProgram(inst_pool, block_pool, env, cfg, host);
-        Shader::Maxwell::ConvertLegacyToGeneric(program, runtime);
-        diagnostic["phase"] = "spirv";
         Shader::Profile profile{};
         profile.supported_spirv = 0x00010400;
         profile.unified_descriptor_binding = true;
@@ -750,8 +775,62 @@ int main(int argc, char** argv) {
         profile.max_user_clip_distances = 8;
         profile.max_subgroup_size = 32;
         profile.support_typeless_image_loads = true;
-        Shader::Backend::Bindings bindings{};
-        const auto spirv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime, program, bindings);
+        if (timings_enabled) {
+            diagnostic["timings"] = {
+                {"unit", "ms"},
+                {"clock", "steady_clock wall time"},
+                {"scope", "CFG through SPIR-V; excludes input, native lowering, environment copy, "
+                          "pool destruction and output; no Vulkan driver compilation"},
+                {"fresh_pools_and_environment", true},
+                {"samples", Json::array()}};
+        }
+        using Clock = std::chrono::steady_clock;
+        const auto now = [&] { return timings_enabled ? Clock::now() : Clock::time_point{}; };
+        const auto ms = [](auto duration) {
+            return std::chrono::duration<double, std::milli>(duration).count();
+        };
+        std::vector<u32> spirv;
+        for (u32 iteration = 0; iteration < iterations; ++iteration) {
+            // IR-pointer/query caches must not survive the pools they refer to.
+            auto iteration_env = env;
+            diagnostic["phase"] = "translate";
+            const auto begin = now();
+            Shader::ObjectPool<Shader::Maxwell::Flow::Block> flow_pool;
+            const auto cfg_begin = now();
+            Shader::Maxwell::Flow::CFG cfg{
+                iteration_env, flow_pool, Shader::Maxwell::Location{iteration_env.EntryPoint()}};
+            const auto cfg_end = now();
+            Shader::ObjectPool<Shader::IR::Inst> inst_pool;
+            Shader::ObjectPool<Shader::IR::Block> block_pool;
+            Shader::Maxwell::TranslationTimings translation;
+            auto program = Shader::Maxwell::TranslateProgram(
+                inst_pool, block_pool, iteration_env, cfg, host,
+                timings_enabled ? &translation : nullptr);
+            const auto remap_begin = now();
+            Shader::Maxwell::ConvertLegacyToGeneric(program, runtime);
+            const auto remap_end = now();
+            diagnostic["phase"] = "spirv";
+            Shader::Backend::Bindings bindings{};
+            const auto spirv_begin = now();
+            auto result = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime, program, bindings);
+            const auto end = now();
+            if (iteration == 0) {
+                spirv = std::move(result);
+            } else if (spirv != result) {
+                throw std::runtime_error("SPIR-V differs between repeated compilations");
+            }
+            if (timings_enabled) {
+                Json passes = Json::object();
+                for (size_t pass = 0; pass < translation.Names.size(); ++pass) {
+                    passes[std::string{translation.Names[pass]}] = translation.milliseconds[pass];
+                }
+                diagnostic["timings"]["samples"].push_back(
+                    {{"iteration", iteration}, {"cfg_ms", ms(cfg_end - cfg_begin)},
+                     {"translation_ms", translation.total_ms}, {"passes_ms", std::move(passes)},
+                     {"remap_ms", ms(remap_end - remap_begin)},
+                     {"spirv_ms", ms(end - spirv_begin)}, {"total_ms", ms(end - begin)}});
+            }
+        }
         diagnostic["spirv_words"] = spirv.size();
         diagnostic["phase"] = "output";
         WriteFile(output, spirv);

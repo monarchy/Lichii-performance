@@ -38,12 +38,17 @@ new lowering no longer produces the exact bytes stored in the older cache.
 
 ## Inputs and coverage
 
-The loader reads little-endian `yuzucach` Vulkan caches, fork versions 46 through 50. It verifies each
+The loader reads little-endian `yuzucach` Vulkan caches, fork versions 46 through 50 and 53. It verifies each
 record boundary and rejects unknown versions or truncated input. Version 47 includes captured
 storage-pointer classifications; versions 48 through 50 retain that layout and version 46 omits them.
 Version 49 invalidates pipelines after tessellation patch-size clamping. Version 50 captures the
 additional texture-table context needed by dynamic texture/static sampler composition. Neither
 changes the serialized layout.
+Version 53 also captures three mesh registers and an 80-byte primitive header for Task/Mesh
+stages. Those stages can be compiled in isolation with the captured context; compatibility with
+the sibling stage's task payload and outputs is not checked. Vertex-A still needs a combined
+vertex pipeline and is reported as missing context. The C++ CLI also accepts versions 51 and 52;
+the Python cache walker continues to reject those unsurveyed complete-cache versions.
 Graphics keys are the 1,056-byte layout
 from these versions; compute keys contain 24 bytes. Driver pipeline blobs and `vulkan_used`
 indexes do not contain replayable shader environments and are not treated as shader inputs.
@@ -88,4 +93,29 @@ defects. Each records its source cache hash and byte offset. Run them with:
 
 ```sh
 python3 tools/shader-sweep/test_captured.py /path/to/shader-sweep
+```
+
+## Compiler timings
+
+Replay one extracted environment with a fresh environment copy and IR pools on every iteration:
+
+```sh
+shader-sweep --environment shader.env --cache-version 53 \
+    --pipeline-key pipeline.key --output shader.spv --timings --iterations 13
+```
+
+Omit the graphics key for compute. JSON `timings.samples` contains CFG, translation, individual
+translation passes, legacy-attribute remapping, SPIR-V emission and total wall times in
+milliseconds. Repeated outputs must be byte-identical. The default invocation does not read
+clocks or add timing fields; `--iterations` greater than one requires `--timings`.
+
+The total runs from CFG construction through SPIR-V emission. Input parsing, native lowering,
+environment copies, pool destruction, output writes and Vulkan driver compilation are excluded.
+This measures repeated fresh IR compilation, not frame times or a cold operating-system cache.
+Use the same compiler, profile and captured keys on both sides and alternate the old and new
+binaries (for example A/B/B/A). Keep raw captures and emitted modules private; share aggregate
+measurements and the exact source revisions instead.
+
+```sh
+python3 tools/shader-sweep/test_cli.py /path/to/shader-sweep
 ```

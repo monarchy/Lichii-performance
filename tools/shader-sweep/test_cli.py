@@ -44,6 +44,9 @@ def environment(version, stage, instructions=(MAXWELL_EXIT,), formats=()):
     record += struct.pack("<4I", 1, 1, 1, 0) if stage == 5 else header(stage)
     if stage == 3:
         record += bytes(32)
+    if version >= 53 and stage in (7, 8):
+        # One thread, up to three vertices and one triangle, minimum task payload.
+        record += struct.pack("<3I", 4 | (3 << 4) | (1 << 13), 0, 0) + header(stage)
     return record
 
 
@@ -263,7 +266,64 @@ class CliTests(unittest.TestCase):
         source = self.write("native.bin", NATIVE_EXIT)
         result = self.run_cli(source, "--stage", "compute", "--output", self.output)
         self.assertTrue(any("workgroup 1x1x1" in item for item in result["assumptions"]))
+        self.assertNotIn("timings", result)
         self.validate()
+
+    def test_repeated_compilation_timings_preserve_output(self):
+        capture = self.write("shader.env", environment(53, 4))
+        self.run_cli("--environment", capture, "--cache-version", 53, "--output", self.output)
+        expected = self.output.read_bytes()
+        result = self.run_cli("--environment", capture, "--cache-version", 53, "--output",
+                              self.output, "--timings", "--iterations", 3)
+        self.assertEqual(self.output.read_bytes(), expected)
+        timings = result["timings"]
+        self.assertEqual(timings["unit"], "ms")
+        self.assertTrue(timings["fresh_pools_and_environment"])
+        self.assertIn("no Vulkan driver compilation", timings["scope"])
+        self.assertEqual([s["iteration"] for s in timings["samples"]], [0, 1, 2])
+        for sample in timings["samples"]:
+            for field in ("cfg_ms", "translation_ms", "remap_ms", "spirv_ms", "total_ms"):
+                self.assertGreaterEqual(sample[field], 0)
+            self.assertIn("ssa", sample["passes_ms"])
+            self.assertTrue(all(value >= 0 for value in sample["passes_ms"].values()))
+        self.validate()
+
+    def test_invalid_timing_arguments(self):
+        source = self.write("native.bin", NATIVE_EXIT)
+        for count in ("0", "1001", "-1", "1.5", "1x", "99999999999"):
+            with self.subTest(count=count):
+                self.run_cli(source, "--stage", "compute", "--output", self.output,
+                             "--timings", "--iterations", count, code=2)
+        self.run_cli(source, "--stage", "compute", "--output", self.output,
+                     "--iterations", 2, code=2)
+        self.run_cli(source, "--lower-only", self.output, "--timings", code=2)
+        self.assertFalse(self.output.exists())
+
+    def test_captured_task_and_mesh_require_complete_v53_context(self):
+        for stage, name, model in ((7, "task", 5364), (8, "mesh", 5365)):
+            with self.subTest(stage=name):
+                capture = self.write("shader.env", environment(53, stage))
+                result = self.run_cli("--environment", capture, "--cache-version", 53,
+                                      "--output", self.output)
+                self.assertEqual(result["stage"], name)
+                self.assertTrue(any("linkage is not validated" in item for item in result["assumptions"]))
+                models = [args[0] for op, args in spirv_instructions(self.output.read_bytes()) if op == 15]
+                self.assertEqual(models, [model])
+                self.validate()
+                capture.write_bytes(environment(52, stage))
+                result = self.run_cli("--environment", capture, "--cache-version", 52,
+                                      "--output", self.output, code=1)
+                self.assertEqual(result["error"]["code"], "missing_context")
+                capture.write_bytes(environment(53, stage)[:-1])
+                self.run_cli("--environment", capture, "--cache-version", 53,
+                             "--output", self.output, code=2)
+
+    def test_vertex_a_still_requires_pipeline_linkage(self):
+        capture = self.write("shader.env", environment(53, 6))
+        result = self.run_cli("--environment", capture, "--cache-version", 53,
+                              "--output", self.output, code=1)
+        self.assertEqual(result["error"]["code"], "missing_context")
+        self.assertFalse(self.output.exists())
 
     def test_exact_native_header_stages(self):
         for stage, name in enumerate(STAGES[:5]):
@@ -307,7 +367,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(sum(op == 218 for op, _ in emitted), 1)
 
     def test_both_cache_versions_all_stages(self):
-        for version in (46, 47, 48, 49, 50, 51, 52):
+        for version in (46, 47, 48, 49, 50, 51, 52, 53):
             for stage, name in enumerate(STAGES):
                 with self.subTest(version=version, stage=name):
                     capture = self.write("shader.env", environment(version, stage))
