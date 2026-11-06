@@ -1,89 +1,54 @@
-<!--
-# SPDX-FileCopyrightText: Copyright 2025 Eden Emulator Project
-# SPDX-License-Identifier: GPL-3.0-or-later
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 
-# SPDX-FileCopyrightText: 2018 yuzu Emulator Project
-# SPDX-License-Identifier: GPL-2.0-or-later
--->
+# Lichii performance
 
-<p align="center">
-  <img src="dist/branding/lichii_icon_with_logo.png" alt="Lichii" width="600">
-</p>
+An experimental performance fork of [zortos293/Lichii](https://github.com/zortos293/Lichii),
+the open-source Nintendo Switch and Switch 2 emulator descended from Eglantine, Eden,
+yuzu and Sudachi. This fork is independent of those projects and Nintendo.
 
-# Lichii
+[Описание изменений на русском](docs/performance-fork.ru.md) ·
+[Changes, measurements and limitations](docs/performance-fork.md) ·
+[Upstream project](https://github.com/zortos293/Lichii)
 
-Lichii is an experimental, open-source Nintendo Switch and Switch 2 emulator written in C++. It builds on Eglantine, Eden, yuzu and Sudachi, preserving their contributions while developing this fork's game compatibility and renderer fixes.
+## Changes
 
-This is an independent fork, not an official release of those upstream projects. Lichii is not affiliated with Nintendo.
+- Port Eglantine's GPU scheduler ownership and idle-hook synchronization fixes.
+- Yield during long waits for a GPU idle hook instead of repeatedly polling completed commands.
+- Release Switch 2 guest memory after a game stops, and recreate it for the next game.
+- Bound Vulkan pipeline successor caches to 16 pointers instead of keeping an unbounded
+  collection of full graphics-state key copies.
+- Add focused regression tests and a reproducible synthetic lookup benchmark.
+- Keep the existing Eden data directory and Lichii's newer native buffer/shader handling.
 
-## Downloads and setup
+The new successor cache passed five focused tests (12,316 assertions) on Windows.
+Its cache object is 136 bytes on this 64-bit build, with no per-transition allocations.
+Synthetic high-fan-out lookups improved, while a 17-successor boundary case became slightly
+slower. See the complete [results and tradeoffs](docs/performance-fork.md).
 
-Published builds belong on this fork's [releases page](https://github.com/zortos293/Eglantine/releases). The repository still uses its historical Eglantine name; the desktop application is now Lichii.
+**These are code and synthetic benchmark results, not a claim of higher game FPS.**
+Full-build status and gameplay validation are recorded separately in the change notes.
 
-On Windows, extract the entire build archive and run **lichii.exe**. Only use games and system files you have legally obtained. Games, keys and firmware are not included.
+## Building and testing
 
-### Existing saves and settings
+Follow the upstream [build guide](docs/Build.md) and [coding guidelines](docs/Coding.md).
+The desktop GUI target is `yuzu` and produces `lichii.exe`; the command-line target is
+`yuzu-cmd` and produces `eden-cli.exe` on Windows. Configure with `YUZU_TESTS=ON` to include
+the new cases, then run `tests "[pipeline_transitions]"`.
 
-The rebrand intentionally retains the existing Eden/Eglantine data directories and configuration keys. It does not move or delete saves, settings or shader caches. Back up your saves before testing experimental builds.
+The [benchmark source](tools/nx2/pipeline_transition_bench.cpp) uses synthetic keys and the
+production CityHash64 and Boost fallback container. Instructions and exact environment
+are in the [validation notes](docs/performance-fork.md#reproducing-the-focused-checks).
 
-## Compatibility and issue reports
+## Existing data
 
-Compatibility and performance vary by game, hardware and driver. Rendering errors, stutters and crashes remain possible. Passing automated tests does not establish that a game renders correctly, and this project makes no universal frame-rate guarantee.
-
-When [reporting an issue](https://github.com/zortos293/Eglantine/issues), include:
-
-- The exact build, game version, CPU, GPU and driver version.
-- Relevant settings and steps to reproduce the problem.
-- A screenshot and the log from the affected session, after checking it for personal information.
-
-Do not upload game files, keys, firmware or private account information.
-
-## Building and contributing
-
-See the [build guide](docs/Build.md), [user documentation](docs/user/README.md) and [coding guidelines](docs/Coding.md). Some inherited documentation and internal build target names still use upstream names. The GUI build target remains `yuzu`; its output is `lichii.exe` on Windows and `lichii` on other desktop platforms.
-
-Keep changes focused and distinguish code-level checks from actual gameplay testing.
-
-## Artwork
-Art created by YOB (yobslab)
-The supplied Lichii logo, icon and library artwork are in [dist/branding](dist/branding). Windows, Linux and macOS icon resources are generated from that artwork by [Generate-LichiiIcons.ps1](tools/Generate-LichiiIcons.ps1).
-
-## Support Lichii
-
-Lichii is free and stays free. If you want to help, you can donate in crypto. Donations help pay for the AI tools and build machines used to develop this open-source project faster.
-
-**Solana (SOL)**
-```text
-JepEjfyWjGjhJvHSrqj52KtLjcbbbmUh1iGqerYBF4w
-```
-
-**Ethereum (ETH)**
-```text
-0x055ABa1b80Bc35C836Ce7E9F47c2b3d6C75b5534
-```
-
-**Bitcoin (BTC)**
-```text
-bc1qcvxdpf4qvdhqp8ee4s355cjmxrzsphsdwpl8w4
-```
-
-**BNB Smart Chain (BNB)**
-```text
-0x055ABa1b80Bc35C836Ce7E9F47c2b3d6C75b5534
-```
-
-**Polygon**
-```text
-0x055ABa1b80Bc35C836Ce7E9F47c2b3d6C75b5534
-```
-
-Send each coin on its matching network. Coins sent on the wrong network can't be recovered.
-
-> [!NOTE]
-> Donations are voluntary gifts and are non-refundable. A donation does not buy any product, service, perk, early access, exclusive build, priority support or say in the project. Every release stays free and public for everyone.
+The application retains the existing Eden data directory, settings, saves and shader caches.
+Use a backed-up or isolated data directory when trying an experimental build.
+Games and system files are not included.
 
 ## Credits and license
 
-Lichii inherits the work of the Eglantine, Eden, yuzu and Sudachi projects and their contributors, including Eglantine's original developer Camille LaVey. Original copyright notices and third-party licenses are retained.
-
-See [LICENSE.txt](LICENSE.txt) and the source files for applicable license terms.
+Original copyright notices and third-party licenses remain in effect. Lichii inherits the
+work of the Eglantine, Eden, yuzu and Sudachi contributors, including Eglantine's original
+developer Camille LaVey. Upstream fixes are identified individually in the change notes.
+This fork's implementation, review, tests and documentation were assisted by OpenAI Codex.
+See [LICENSE.txt](LICENSE.txt) and the individual source-file notices.
