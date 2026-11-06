@@ -92,6 +92,6 @@ if (Test-Path -LiteralPath $runtimeLicenses -PathType Container) {
 Copy-Item -LiteralPath (Join-Path $repo 'docs\performance-fork.md') -Destination $package
 Copy-Item -LiteralPath (Join-Path $repo 'docs\performance-fork.ru.md') -Destination $package
 New-Item -ItemType Directory -Path (Join-Path $package 'performance') -Force | Out-Null
-Copy-Item -LiteralPath (Join-Path $repo 'docs\performance\pipeline-transition-results.csv') `
-    -Destination (Join-Path $package 'performance')
+Get-ChildItem -LiteralPath (Join-Path $repo 'docs\performance') -Filter '*.csv' -File |
+    Copy-Item -Destination (Join-Path $package 'performance')
 Write-Output "Package prepared: $package"

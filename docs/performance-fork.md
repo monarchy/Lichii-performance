@@ -267,4 +267,52 @@ separate compiler, baseline, patch and memory effects. Movement, other scenes, c
 shader stutters, physical display pacing and game-speed correctness remain untested.
 Keep raw logs, captures, games, keys, firmware, saves and personal paths local.
 
+## Stutter investigation
+
+The subsequent investigation used private copies of the same game, save and initial cache on
+the same PC. `EDEN_NX2_GPU_PROFILE=1` and `EDEN_DKB_FRAME_TRACE=1` were enabled for diagnosis.
+These flags add overhead: their FPS and short moving intervals are not a new comparison with
+build 88, and different final camera angles prevent treating separate exploratory runs as A/B.
+
+Native guest-frame intervals confirmed a 335.271 ms frame during a first camera turn. Its
+timeline coincided with 51.9 ms of GPU-owner pipeline preparation and 250.2 ms of worker
+emission/driver work. A separate 202.782 ms movement frame contained 26 synchronous runtime
+pipeline builds totaling 167.5 ms. In another run, a measured driver call took 261.344 ms
+(234.375 ms of the calling thread's CPU time); the corresponding guest interval was 307.489 ms.
+That frame occurred before the marked pan interval. These are guest intervals and correlated
+compiler timings, not physical display measurements.
+
+Targeted timings ruled out the four observed used-pipeline-list saves as the large stalls:
+they took 0.682–0.806 ms including snapshot hashing, file open/write/close and cleanup.
+The first measured retirement burst destroyed 856 completed pipelines in one frame, taking
+5.319 ms. `TickFrame()` now retires at most 64 per call. It still checks the oldest GPU fence
+before destruction, keeps FIFO order and clears all remaining retired objects during teardown.
+Unused driver objects therefore stay resident a few extra frames; the count limit does not
+bound one unusually slow driver destructor or the number of retained bytes.
+
+The limit was exercised in a live run: 781 objects drained over 13 consecutive frame ticks,
+with a maximum of 64 objects/0.665 ms per batch and a final pending count of zero. Total
+destruction work was 6.557 ms; the purpose is to distribute it, not reduce that total.
+Another 20-object batch also drained completely. The earlier 856-object burst and this
+781-object burst have different scene history and are not equivalent workloads. The
+[aggregate timings](performance/ocarina-retirement-results.csv) report both counts explicitly.
+
+The new timings are off unless the existing GPU profile is enabled; they add no clock reads
+to the disabled path. Runtime reports now name their actual accumulated reporting window,
+instead of incorrectly labelling every delayed report as the last ten seconds. The bundled
+switch-file comment also matches the existing parser: `FRAMES_AHEAD` supports 0/1, and Ocarina
+already defaults to 1 with a GPU-lag check. No frame-wait setting was changed.
+
+The primary remaining compilation cost is inside `TranslateProgram`/merge. An observed subset
+of 37 runtime builds spent 340.636 of 349.932 ms there; environment capture, pool acquisition,
+CFG and wrapper timings were much smaller. This does not identify an individual optimization
+pass. Reusing IR solely by shader hash would ignore captured constant-buffer/texture state,
+stage interactions and object-pool lifetimes, so no such shortcut or draw-discard mode is used.
+
+Raw logs, cache entries and game data remain local. This change should be evaluated as a
+bounded retirement improvement, not a claim that first-use compilation stutters are fixed.
+After these source changes, all 790 existing test cases passed again (775 main cases,
+8 update-checker and 7 configuration cases). Six cache/worker cases included in the main
+suite also passed a separate focused repeat; they are not six additional unique cases.
+
 Implementation, investigation, review, tests and this documentation were assisted by OpenAI Codex.

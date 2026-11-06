@@ -1,0 +1,3 @@
+run,retirement_policy,retired_objects,batches,max_objects_in_batch,max_batch_wall_ms,sum_batch_wall_ms,final_pending,gpu_profile,frame_trace,comparison_limit
+diagnostic-02,unbounded,856,1,856,5.319,5.319,0,on,on,Exploratory runs; scene and retired-object counts differ; not an FPS A/B
+diagnostic-03,64 per frame,781,13,64,0.665,6.557,0,on,on,Exploratory runs; scene and retired-object counts differ; not an FPS A/B

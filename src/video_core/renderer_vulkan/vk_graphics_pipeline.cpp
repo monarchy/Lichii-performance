@@ -18,6 +18,7 @@
 
 #include "common/bit_field.h"
 #include "common/scope_exit.h"
+#include "common/thread_cpu_clock.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
@@ -353,7 +354,26 @@ GraphicsPipeline::GraphicsPipeline(
         };
         try {
             if (emit_stages) {
+                const bool profile = VideoCommon::Nx2Profile::Enabled();
+                const auto emit_begin = profile ? std::chrono::steady_clock::now()
+                                                : std::chrono::steady_clock::time_point{};
+                const auto cpu_begin = profile ? Common::CurrentThreadCpuTimeNs() : std::nullopt;
                 spv_modules = emit_stages();
+                if (profile) {
+                    const auto elapsed = std::chrono::steady_clock::now() - emit_begin;
+                    const auto cpu_end = Common::CurrentThreadCpuTimeNs();
+                    if (elapsed > std::chrono::milliseconds{2}) {
+                        const double cpu_ms = cpu_begin && cpu_end && *cpu_end >= *cpu_begin
+                                                  ? static_cast<double>(*cpu_end - *cpu_begin) /
+                                                        1'000'000.0
+                                                  : -1.0;
+                        LOG_INFO(Render_Vulkan,
+                                 "GPU profile pipeline emission: pipeline={:016x} wall_ms={:.3f} "
+                                 "host_cpu_ms={:.3f} (-1 unavailable)",
+                                 key.Hash(),
+                                 std::chrono::duration<double, std::milli>(elapsed).count(), cpu_ms);
+                    }
+                }
             }
             const VkRenderPass render_pass{render_pass_cache.Get(MakeRenderPassKey(key.state, device))};
             Validate();
@@ -1249,6 +1269,10 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
     }
 
+    const bool profile = VideoCommon::Nx2Profile::Enabled();
+    const auto driver_begin = profile ? std::chrono::steady_clock::now()
+                                     : std::chrono::steady_clock::time_point{};
+    const auto cpu_begin = profile ? Common::CurrentThreadCpuTimeNs() : std::nullopt;
     pipeline = device.GetLogical().CreateGraphicsPipeline({
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
         .pNext = nullptr,
@@ -1270,6 +1294,19 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         .basePipelineHandle = nullptr,
         .basePipelineIndex = 0,
     }, *pipeline_cache);
+    if (profile) {
+        const auto elapsed = std::chrono::steady_clock::now() - driver_begin;
+        const auto cpu_end = Common::CurrentThreadCpuTimeNs();
+        if (elapsed > std::chrono::milliseconds{2}) {
+            const double cpu_ms = cpu_begin && cpu_end && *cpu_end >= *cpu_begin
+                                      ? static_cast<double>(*cpu_end - *cpu_begin) / 1'000'000.0
+                                      : -1.0;
+            LOG_INFO(Render_Vulkan,
+                     "GPU profile pipeline driver: pipeline={:016x} wall_ms={:.3f} "
+                     "host_cpu_ms={:.3f} (-1 unavailable)",
+                     key.Hash(), std::chrono::duration<double, std::milli>(elapsed).count(), cpu_ms);
+        }
+    }
 
     // Log graphics pipeline creation
     if (GPU::Logging::IsActive()) {

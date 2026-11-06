@@ -22,6 +22,7 @@
 #include "common/scope_exit.h"
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
+#include "common/thread_cpu_clock.h"
 #include "common/thread_worker.h"
 #include "core/core.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
@@ -34,6 +35,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_perf.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/pipeline_cache_files.h"
 #include "video_core/renderer_vulkan/async_draw_policy.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
@@ -748,28 +750,67 @@ void PipelineCache::SaveUsedPipelines() {
         used_this_session.size() + used_and_evicted.size() < MinimumUsed) {
         return;
     }
-    std::unordered_map<u64, u8> next;
-    next.reserve(used_pipelines.size() + used_this_session.size());
-    for (const auto& [key, pipeline] : graphics_cache) {
-        if (used_this_session.contains(pipeline.get())) {
-            next.emplace(key.Hash(), u8{0});
+    const bool profiling_enabled = VideoCommon::Nx2Profile::Enabled();
+    using Clock = std::chrono::steady_clock;
+    const auto begin = profiling_enabled ? Clock::now() : Clock::time_point{};
+    const auto cpu_begin = profiling_enabled ? Common::CurrentThreadCpuTimeNs() : std::nullopt;
+    u32 count{};
+    Clock::time_point snapshot_end{}, open_end{}, write_end{}, close_end{};
+    {
+        std::unordered_map<u64, u8> next;
+        next.reserve(used_pipelines.size() + used_this_session.size());
+        for (const auto& [key, pipeline] : graphics_cache) {
+            if (used_this_session.contains(pipeline.get())) {
+                next.emplace(key.Hash(), u8{0});
+            }
+        }
+        for (const u64 hash : used_and_evicted) {
+            next.emplace(hash, u8{0});
+        }
+        for (const auto& [hash, age] : used_pipelines) {
+            if (age + 1 < MaxUsedPipelineAge(device)) {
+                next.try_emplace(hash, static_cast<u8>(age + 1));
+            }
+        }
+        count = static_cast<u32>(next.size());
+        if (profiling_enabled) {
+            snapshot_end = Clock::now();
+        }
+        {
+            std::ofstream file{used_pipelines_filename, std::ios::binary | std::ios::trunc};
+            if (profiling_enabled) {
+                open_end = Clock::now();
+            }
+            file.write(reinterpret_cast<const char*>(&UsedPipelinesMagic), sizeof(UsedPipelinesMagic));
+            file.write(reinterpret_cast<const char*>(&count), sizeof(count));
+            for (const auto& [hash, age] : next) {
+                file.write(reinterpret_cast<const char*>(&hash), sizeof(hash));
+                file.write(reinterpret_cast<const char*>(&age), sizeof(age));
+            }
+            if (profiling_enabled) {
+                write_end = Clock::now();
+            }
+        }
+        if (profiling_enabled) {
+            close_end = Clock::now();
         }
     }
-    for (const u64 hash : used_and_evicted) {
-        next.emplace(hash, u8{0});
-    }
-    for (const auto& [hash, age] : used_pipelines) {
-        if (age + 1 < MaxUsedPipelineAge(device)) {
-            next.try_emplace(hash, static_cast<u8>(age + 1));
-        }
-    }
-    std::ofstream file{used_pipelines_filename, std::ios::binary | std::ios::trunc};
-    const u32 count = static_cast<u32>(next.size());
-    file.write(reinterpret_cast<const char*>(&UsedPipelinesMagic), sizeof(UsedPipelinesMagic));
-    file.write(reinterpret_cast<const char*>(&count), sizeof(count));
-    for (const auto& [hash, age] : next) {
-        file.write(reinterpret_cast<const char*>(&hash), sizeof(hash));
-        file.write(reinterpret_cast<const char*>(&age), sizeof(age));
+    if (profiling_enabled) {
+        const auto end = Clock::now();
+        const auto cpu_end = Common::CurrentThreadCpuTimeNs();
+        const double cpu_ms = cpu_begin && cpu_end && *cpu_end >= *cpu_begin
+                                  ? static_cast<double>(*cpu_end - *cpu_begin) / 1'000'000.0
+                                  : -1.0;
+        const auto ms = [](auto duration) {
+            return std::chrono::duration<double, std::milli>(duration).count();
+        };
+        LOG_INFO(Render_Vulkan,
+                 "GPU profile used pipelines: frame={} entries={} snapshot_hash_ms={:.3f} "
+                 "open_ms={:.3f} write_ms={:.3f} close_ms={:.3f} cleanup_ms={:.3f} total_wall_ms={:.3f} "
+                 "host_cpu_ms={:.3f} (-1 unavailable)",
+                 frame_count, count, ms(snapshot_end - begin), ms(open_end - snapshot_end),
+                 ms(write_end - open_end), ms(close_end - write_end), ms(end - close_end),
+                 ms(end - begin), cpu_ms);
     }
 }
 
@@ -1145,8 +1186,24 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
 
 void PipelineCache::TickFrame() {
     ++frame_count;
-    while (!evicted_pipelines.empty() && scheduler.IsFree(evicted_pipelines.front().first)) {
+    const bool profiling_enabled = VideoCommon::Nx2Profile::Enabled() && !evicted_pipelines.empty();
+    const auto begin = profiling_enabled ? std::chrono::steady_clock::now()
+                                        : std::chrono::steady_clock::time_point{};
+    size_t destroyed = 0;
+    // Spread driver destruction across frames; this briefly retains already-unused pipelines.
+    constexpr size_t MaxRetiredPipelinesPerFrame = 64;
+    while (destroyed < MaxRetiredPipelinesPerFrame && !evicted_pipelines.empty() &&
+           scheduler.IsFree(evicted_pipelines.front().first)) {
         evicted_pipelines.pop_front();
+        ++destroyed;
+    }
+    if (profiling_enabled && destroyed != 0) {
+        const auto elapsed = std::chrono::steady_clock::now() - begin;
+        LOG_INFO(Render_Vulkan,
+                 "GPU profile pipeline destruction: frame={} destroyed={} pending={} "
+                 "wall_ms={:.3f}",
+                 frame_count, destroyed, evicted_pipelines.size(),
+                 std::chrono::duration<double, std::milli>(elapsed).count());
     }
     constexpr u64 EvictCheckFrames = 600;
     if (frame_count % EvictCheckFrames == 0) {
@@ -1167,6 +1224,10 @@ void PipelineCache::EvictUnusedPipelines() {
     if (frame_count <= EvictAfterFrames) {
         return;
     }
+    const bool profiling_enabled = VideoCommon::Nx2Profile::Enabled();
+    using Clock = std::chrono::steady_clock;
+    const auto begin = profiling_enabled ? Clock::now() : Clock::time_point{};
+    const size_t scanned = graphics_cache.size();
     const u64 cutoff = frame_count - EvictAfterFrames;
     const u64 tick = scheduler.CurrentTick();
     size_t evicted = 0;
@@ -1184,13 +1245,29 @@ void PipelineCache::EvictUnusedPipelines() {
         it = graphics_cache.erase(it);
         ++evicted;
     }
+    const auto scan_end = profiling_enabled ? Clock::now() : Clock::time_point{};
+    if (evicted != 0) {
+        for (auto& [key, pipeline] : graphics_cache) {
+            if (pipeline) {
+                pipeline->ClearTransitions();
+            }
+        }
+    }
+    if (profiling_enabled) {
+        const auto end = Clock::now();
+        if (end - begin > std::chrono::milliseconds{2}) {
+            const auto ms = [](auto duration) {
+                return std::chrono::duration<double, std::milli>(duration).count();
+            };
+            LOG_INFO(Render_Vulkan,
+                     "GPU profile pipeline eviction: frame={} scanned={} evicted={} remaining={} "
+                     "scan_ms={:.3f} clear_transitions_ms={:.3f} total_wall_ms={:.3f}",
+                     frame_count, scanned, evicted, graphics_cache.size(), ms(scan_end - begin),
+                     ms(end - scan_end), ms(end - begin));
+        }
+    }
     if (evicted == 0) {
         return;
-    }
-    for (auto& [key, pipeline] : graphics_cache) {
-        if (pipeline) {
-            pipeline->ClearTransitions();
-        }
     }
     LOG_INFO(Render_Vulkan, "Evicted {} graphics pipelines unused for {} frames, {} left", evicted,
              EvictAfterFrames, graphics_cache.size());
@@ -1240,6 +1317,41 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     bool build_in_parallel, std::shared_ptr<ShaderPools> emit_pools,
     std::unique_ptr<EmissionBudget::Reservation> reservation) try {
     auto hash = key.Hash();
+    const bool profiling_enabled = build_in_parallel && VideoCommon::Nx2Profile::Enabled();
+    using Clock = std::chrono::steady_clock;
+    const auto build_begin = profiling_enabled ? Clock::now() : Clock::time_point{};
+    const auto cpu_begin = profiling_enabled ? Common::CurrentThreadCpuTimeNs() : std::nullopt;
+    std::array<double, Maxwell::MaxShaderProgram> cfg_ms{}, translate_ms{}, remap_ms{}, sync_spirv_ms{};
+    double wrapper_ms{};
+    const bool deferred_emission = emit_pools != nullptr;
+    bool completed{};
+    SCOPE_EXIT {
+        if (profiling_enabled) {
+            const auto elapsed = Clock::now() - build_begin;
+            const auto cpu_end = Common::CurrentThreadCpuTimeNs();
+            if (elapsed > std::chrono::milliseconds{2}) {
+                const double cpu_ms = cpu_begin && cpu_end && *cpu_end >= *cpu_begin
+                                          ? static_cast<double>(*cpu_end - *cpu_begin) / 1'000'000.0
+                                          : -1.0;
+                LOG_INFO(Render_Vulkan,
+                         "GPU profile runtime pipeline CPU: pipeline={:016x} frame={} completed={} "
+                         "deferred_emission={} wrapper_ms={:.3f} total_wall_ms={:.3f} "
+                         "host_cpu_ms={:.3f} (-1 unavailable)",
+                         hash, frame_count, completed, deferred_emission, wrapper_ms,
+                         std::chrono::duration<double, std::milli>(elapsed).count(), cpu_ms);
+                for (size_t stage = 0; stage < key.unique_hashes.size(); ++stage) {
+                    if (key.unique_hashes[stage] != 0 || translate_ms[stage] != 0) {
+                        LOG_INFO(Render_Vulkan,
+                                 "GPU profile runtime pipeline stage: pipeline={:016x} s{}:{:016x} "
+                                 "cfg_ms={:.3f} translate_merge_ms={:.3f} runtime_remap_ms={:.3f} "
+                                 "sync_spirv_ms={:.3f}",
+                                 hash, stage, key.unique_hashes[stage], cfg_ms[stage],
+                                 translate_ms[stage], remap_ms[stage], sync_spirv_ms[stage]);
+                    }
+                }
+            }
+        }
+    };
     LOG_DEBUG(Render_Vulkan, "{:#016x}", hash);
     size_t env_index{0};
     std::array<Shader::IR::Program, Maxwell::MaxShaderProgram> programs;
@@ -1253,9 +1365,14 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         const bool is_emulated_stage = layer_source_program != nullptr &&
                                        index == static_cast<u32>(Maxwell::ShaderType::Geometry);
         if (key.unique_hashes[index] == 0 && is_emulated_stage) {
+            const auto stage_begin = profiling_enabled ? Clock::now() : Clock::time_point{};
             auto topology = MaxwellToOutputTopology(key.state.topology);
             programs[index] = GenerateGeometryPassthrough(pools.inst, pools.block, host_info,
                                                           *layer_source_program, topology);
+            if (profiling_enabled) {
+                translate_ms[index] =
+                    std::chrono::duration<double, std::milli>(Clock::now() - stage_begin).count();
+            }
             continue;
         }
         if (key.unique_hashes[index] == 0) {
@@ -1282,7 +1399,13 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
 
         const u32 cfg_offset{static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))};
+        auto stage_begin = profiling_enabled ? Clock::now() : Clock::time_point{};
         Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
+        if (profiling_enabled) {
+            const auto cfg_end = Clock::now();
+            cfg_ms[index] = std::chrono::duration<double, std::milli>(cfg_end - stage_begin).count();
+            stage_begin = cfg_end;
+        }
         if (!uses_vertex_a || index != 1) {
             // Normal path
             programs[index] = TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
@@ -1291,6 +1414,10 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             auto& program_va{programs[0]};
             auto program_vb{TranslateProgram(pools.inst, pools.block, env, cfg, host_info)};
             programs[index] = MergeDualVertexPrograms(program_va, program_vb, env);
+        }
+        if (profiling_enabled) {
+            translate_ms[index] =
+                std::chrono::duration<double, std::milli>(Clock::now() - stage_begin).count();
         }
 
         if (device.GetDriverID() != VK_DRIVER_ID_NVIDIA_PROPRIETARY && Shader::Optimization::HasBrokenPattern(programs[index])) {
@@ -1362,8 +1489,13 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         const size_t stage_index{index - 1};
         infos[stage_index] = &program.info;
 
+        const auto remap_begin = profiling_enabled ? Clock::now() : Clock::time_point{};
         const auto runtime_info{MakeRuntimeInfo(programs, key, program, previous_stage, device)};
         ConvertLegacyToGeneric(program, runtime_info);
+        if (profiling_enabled) {
+            remap_ms[index] =
+                std::chrono::duration<double, std::milli>(Clock::now() - remap_begin).count();
+        }
         if (emit_pools) {
             deferred_runtime_infos[stage_index] = runtime_info;
             if (VideoCommon::Nx2Perf::Verify()) {
@@ -1373,6 +1505,10 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             const auto begin = std::chrono::steady_clock::now();
             modules[stage_index] = EmitShaderModule(device, profile, runtime_info, program, binding,
                                                    key.unique_hashes[index], stage_index);
+            if (profiling_enabled) {
+                sync_spirv_ms[index] =
+                    std::chrono::duration<double, std::milli>(Clock::now() - begin).count();
+            }
             if (build_in_parallel) {
                 AddRuntimeSpirvTime(0, begin);
             }
@@ -1418,10 +1554,17 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         };
     }
     Common::ThreadWorker* const thread_worker{build_in_parallel ? &workers : nullptr};
-    return std::make_unique<GraphicsPipeline>(
+    const auto wrapper_begin = profiling_enabled ? Clock::now() : Clock::time_point{};
+    auto pipeline = std::make_unique<GraphicsPipeline>(
         scheduler, buffer_cache, texture_cache, vulkan_pipeline_cache, &shader_notify, device,
         descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring, thread_worker, statistics,
         render_pass_cache, key, std::move(modules), infos, std::move(emit_stages));
+    if (profiling_enabled) {
+        wrapper_ms =
+            std::chrono::duration<double, std::milli>(Clock::now() - wrapper_begin).count();
+    }
+    completed = true;
+    return pipeline;
 
 } catch (const Shader::Exception& exception) {
     auto hash = key.Hash();
@@ -1449,8 +1592,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
 namespace {
 // Pipelines built on the GPU thread at run time (shader translation, and the SPIR-V unless a worker
 // emits it; the driver compile is on workers): the first 400 over 2 ms and every one over 100 ms
-// are logged, and the totals every 10 s, to tell how much of the stutter on new content is
-// translation.
+// are logged, and the totals on the next build after at least 10 s, to tell how much of the stutter
+// on new content is translation.
 void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_point begin,
                            const std::string& shaders) {
     static std::chrono::steady_clock::duration total{};
@@ -1474,10 +1617,11 @@ void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_poi
             return std::chrono::nanoseconds{counter.exchange(0, std::memory_order::relaxed)};
         };
         LOG_INFO(Render_Vulkan,
-                 "Runtime pipelines in the last 10 s: {} built, {:.1f} ms on the GPU thread "
+                 "Runtime pipelines in the last {:.3f} s: {} built, {:.1f} ms on the GPU thread "
                  "({:.1f} ms of it graphics SPIR-V), {:.1f} ms graphics SPIR-V on workers, "
                  "{:.1f} ms of draws held for unbuilt pipelines",
-                 count, ms(total), ms(take(runtime_spirv_ns[0])), ms(take(runtime_spirv_ns[1])),
+                 std::chrono::duration<double>(now - window).count(), count, ms(total),
+                 ms(take(runtime_spirv_ns[0])), ms(take(runtime_spirv_ns[1])),
                  ms(GraphicsPipeline::TakeHoldTime()));
         total = {};
         count = 0;
@@ -1488,7 +1632,16 @@ void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_poi
 
 std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
     const auto begin = std::chrono::steady_clock::now();
+    const bool profiling_enabled = VideoCommon::Nx2Profile::Enabled();
+    double environment_ms{}, pools_ms{};
     SCOPE_EXIT {
+        if (profiling_enabled && std::chrono::steady_clock::now() - begin >
+                                     std::chrono::milliseconds{2}) {
+            LOG_INFO(Render_Vulkan,
+                     "GPU profile runtime pipeline setup: pipeline={:016x} frame={} "
+                     "environment_capture_ms={:.3f} pools_ms={:.3f}",
+                     graphics_key.Hash(), frame_count, environment_ms, pools_ms);
+        }
         std::string shaders = fmt::format("pipeline={:016x}", graphics_key.Hash());
         for (size_t stage = 0; stage < graphics_key.unique_hashes.size(); ++stage) {
             if (graphics_key.unique_hashes[stage] != 0) {
@@ -1497,8 +1650,16 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
         }
         ReportRuntimePipeline("Graphics", begin, shaders);
     };
+    const auto environment_begin = profiling_enabled ? std::chrono::steady_clock::now()
+                                                     : std::chrono::steady_clock::time_point{};
     GraphicsEnvironments environments;
     GetGraphicsEnvironments(environments, graphics_key.unique_hashes);
+    const auto environment_end = profiling_enabled ? std::chrono::steady_clock::now()
+                                                   : std::chrono::steady_clock::time_point{};
+    if (profiling_enabled) {
+        environment_ms =
+            std::chrono::duration<double, std::milli>(environment_end - environment_begin).count();
+    }
 
     std::shared_ptr<ShaderPools> emit_pools;
     auto reservation = emission_budget.TryAcquire(maxwell3d->GetNativeMacroEngine().native_turing);
@@ -1515,6 +1676,10 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
         }
     } else {
         main_pools.ReleaseContents();
+    }
+    if (profiling_enabled) {
+        pools_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                           environment_end).count();
     }
     ShaderPools& pools = emit_pools ? *emit_pools : main_pools;
     auto pipeline{CreateGraphicsPipeline(pools, graphics_key, environments.Span(), nullptr, true,

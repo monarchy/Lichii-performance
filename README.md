@@ -17,6 +17,9 @@ yuzu and Sudachi. This fork is independent of those projects and Nintendo.
 - Release Switch 2 guest memory after a game stops, and recreate it for the next game.
 - Bound Vulkan pipeline successor caches to 16 pointers instead of keeping an unbounded
   collection of full graphics-state key copies.
+- Spread retirement of completed Vulkan graphics pipelines across frames, up to 64 per frame.
+- Add opt-in timings that distinguish runtime translation, SPIR-V emission, driver compilation,
+  cache persistence and pipeline destruction.
 - Add focused regression tests and a reproducible synthetic lookup benchmark.
 - Correct existing scaler-padding comparisons and Windows archive-reader test lifetimes.
 - Keep the existing Eden data directory and Lichii's newer native buffer/shader handling.
@@ -34,6 +37,10 @@ compiler, source baseline and memory conditions differ. Movement and cold-cache 
 were not tested, and the final original-build run hung during shutdown after its FPS
 measurement. See the [measurements and limitations](docs/performance-fork.md#stationary-gameplay-comparison).
 Synthetic lookup ratios are not game-FPS multipliers or isolated measurements of this patch.
+
+A separate [stutter investigation](docs/performance-fork.md#stutter-investigation) identified
+first-use shader/driver compilation and a smaller burst of pipeline destruction. The retirement
+limit addresses the latter; it does not eliminate compilation of new shaders.
 
 ## Building and testing
 

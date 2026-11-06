@@ -18,9 +18,9 @@ EDEN_NX2_FENCE_BATCH=1
 # 90-220 MB/s of buffers CPU never touches, causing heavy mutex contention and dropping FPS by ~38-63%.
 #EDEN_NX2_BUFFER_DOWNLOADS=1
 
-# Paces frame submission 2 frames ahead. Reduces frametime spikes, but adds ~1-2 frames of input latency.
-# Enable only if frame pacing stability is preferred over responsive controls.
-#EDEN_NX2_FRAMES_AHEAD=2
+# Optional fence-wait override: =1 waits for the previous frame, =0 for the current frame.
+# The default is title-specific; Ocarina already uses =1 with checks for GPU lag.
+#EDEN_NX2_FRAMES_AHEAD=1
 
 # --- Workarounds / Debug ---
 # Terrain/indirect drawing fix for Donkey Kong Bananza: enabled by default. Set to 0 only to leave to GPU.
