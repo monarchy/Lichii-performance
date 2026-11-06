@@ -84,6 +84,11 @@ while ($pending.Count -gt 0) {
 
 Copy-Item -LiteralPath (Join-Path $repo 'LICENSE.txt') -Destination $package
 Copy-Item -LiteralPath (Join-Path $repo 'LICENSES') -Destination $package -Recurse
+$runtimeLicenses = Join-Path (Split-Path -Parent $runtime) 'share\licenses'
+if (Test-Path -LiteralPath $runtimeLicenses -PathType Container) {
+    Copy-Item -LiteralPath $runtimeLicenses `
+        -Destination (Join-Path $package 'third-party-licenses') -Recurse
+}
 Copy-Item -LiteralPath (Join-Path $repo 'docs\performance-fork.md') -Destination $package
 Copy-Item -LiteralPath (Join-Path $repo 'docs\performance-fork.ru.md') -Destination $package
 New-Item -ItemType Directory -Path (Join-Path $package 'performance') -Force | Out-Null
