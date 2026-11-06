@@ -98,13 +98,15 @@ Properties on the tested 64-bit build:
 | Configuration regression suite | Passed: 7 cases, 426 assertions |
 | Packaged DLL import closure | Passed, including the Qt Windows platform plugin |
 | Isolated packaged CLI `--version` smoke check | Exit code 0 with only Windows system directories on `PATH` |
-| Modified executable in Ocarina gameplay | Not run; the existing game has unsaved progress |
+| Modified executable in Ocarina | GUI, game boot and copied-save load succeeded; stationary comparison below |
 
 The tested executable was built from commit
 [`0021060964b301fe18cded25491d012531b1c89d`](https://github.com/monarchy/Lichii-performance/commit/0021060964b301fe18cded25491d012531b1c89d).
-The three CTest executables passed in 19.48 seconds. GUI startup, game boot, rendering,
-frame times and save compatibility have not been validated with the modified executable.
-The existing game process remained running throughout the work.
+The three CTest executables passed in 19.48 seconds. A subsequent game check used four
+disposable portable profiles. Both modified-build runs booted the game and loaded the copied
+save. Fourteen original save files matched their SHA-256 fingerprints after the comparison.
+The original emulator process was left open; it was already showing its game list before
+these measurements. Broad rendering, save compatibility and gameplay coverage remain untested.
 
 The focused cases exercise full key identity, randomized fallback across overflow and
 clearing, clearing before successor destruction, restoration of full capacity after a
@@ -212,12 +214,57 @@ For example, in PowerShell with a UCRT64 toolchain at `C:\msys64`:
   -RuntimeDirectory C:/msys64/ucrt64/bin -Destination ./build/performance-package
 ```
 
-## Gameplay comparison still required
+## Stationary gameplay comparison
 
-After saving progress, compare the original and modified executables with the same game
-version, scene, camera, resolution, GPU accuracy and warm shader cache. Measure frame times
-and long stalls separately from the average FPS, and check rendering and game speed.
-Keep logs, captures, games, keys, firmware and personal paths local. No gameplay performance
-gain is claimed until that comparison exists.
+Measured on 2026-11-06 with a Ryzen 7 7800X3D, RTX 4070 SUPER and 32 GiB RAM. The game was
+Ocarina v1.1.1, in the same saved Kokiri Forest interior, with the same camera and no movement.
+Settings: Vulkan, 2X, GPU Fast, the existing built-in Max Resolution/Dynamic FPS patches,
+the same VSync setting, and frame generation off. Each run started with a fresh copy of the
+same save, configuration and disk shader cache, followed by a scene warm-up.
+
+Order: original **A1**, modified **B1**, modified **B2**, original **A2**. The original is
+build 88 (`55532f2d`, MSVC 19.44); the modified build is `00210609`, Clang 23.1.5.
+No compiler or source-baseline control build was produced, so this compares complete
+executables, not the isolated effect of one optimization.
+
+The primary metric is the delta of the built-in debug server's guest-present counter divided
+by elapsed monotonic time. Both marks were taken while the game was running and the camera
+was stationary. Client and server elapsed times agree within 0.253 ms over these intervals.
+This measures guest presentation requests, not physical monitor frames.
+
+| Run | Build | Seconds | Guest presents | Guest FPS |
+| --- | --- | ---: | ---: | ---: |
+| A1 | Original build 88 | 89.032 | 4,473 | 50.240 |
+| B1 | Performance 00210609 | 89.348 | 4,688 | 52.469 |
+| B2 | Performance 00210609 | 108.431 | 5,841 | 53.869 |
+| A2 | Original build 88 | 97.212 | 4,761 | 48.975 |
+
+The equal-weight mean of two runs per build is **49.6077 → 53.1687 FPS (+7.1782%)**.
+This is an observation for this stationary scene, not a guaranteed improvement elsewhere.
+The full [aggregate CSV](performance/ocarina-gameplay-results.csv) includes both primary
+counter results and the available native frame-time checks.
+
+### Frame-time checks and limitations
+
+The common `record_frame_times=true` setting stores guest-composite intervals in memory and
+exports CSV on shutdown. For A1/B1/B2, verified steady-state windows of approximately 60 s
+gave 50.110/52.401/54.182 FPS and 1% lows of 35.227/35.476/38.164 FPS. These are shorter
+subintervals of the runs above, not independent repeated measurements. The longest frame
+was 31.655/31.715/30.209 ms respectively; none exceeded 50 ms in those selected windows.
+The pause gap and shutdown frames were identified and excluded, with the boundaries checked
+against the recorded pause counters. `1% low` is 1000 divided by the mean of the slowest
+ceil(1% of frames) intervals. GPU timestamp tracing remained off.
+
+The A2 original-build copy hung during shutdown after both FPS marks had been recorded.
+Its native CSV was not exported; its 1% low, p99 and long-stall counts are unknown. Only
+that disposable process was terminated after checking its exact executable path. This
+single shutdown failure does not establish a general stability advantage for either build.
+
+Only two runs per build were measured. Available memory at the start of A1/B1/B2/A2 was
+2458/5588/4187/4026 MiB; paging snapshots also differed. Desktop background activity and
+shared OS/driver cache warm-up were not controlled. The comparison therefore does not
+separate compiler, baseline, patch and memory effects. Movement, other scenes, cold-cache
+shader stutters, physical display pacing and game-speed correctness remain untested.
+Keep raw logs, captures, games, keys, firmware, saves and personal paths local.
 
 Implementation, investigation, review, tests and this documentation were assisted by OpenAI Codex.

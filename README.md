@@ -23,13 +23,17 @@ yuzu and Sudachi. This fork is independent of those projects and Nintendo.
 
 The six new cache/worker tests passed (12,346 assertions) on Windows, along with all
 790 cases across the main, configuration and update-checker suites. GUI and CLI binaries
-were built successfully; gameplay validation remains pending.
-Its cache object is 136 bytes on this 64-bit build, with no per-transition allocations.
+were built successfully. The successor-cache object is 136 bytes on this 64-bit build,
+with no per-transition allocations.
 Synthetic high-fan-out lookups improved, while a 17-successor boundary case became slightly
 slower. See the complete [results and tradeoffs](docs/performance-fork.md).
 
-**These are code and synthetic benchmark results, not a claim of higher game FPS.**
-Build details and remaining gameplay validation are recorded in the change notes.
+A subsequent four-run stationary Ocarina comparison observed **49.61 → 53.17 guest FPS
+(+7.2%)**, averaging two warmed runs per complete build. This is one scene on one PC;
+compiler, source baseline and memory conditions differ. Movement and cold-cache stutters
+were not tested, and the final original-build run hung during shutdown after its FPS
+measurement. See the [measurements and limitations](docs/performance-fork.md#stationary-gameplay-comparison).
+Synthetic lookup ratios are not game-FPS multipliers or isolated measurements of this patch.
 
 ## Building and testing
 
