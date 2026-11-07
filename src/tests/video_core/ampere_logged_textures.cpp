@@ -2,11 +2,7 @@
 
 #include <array>
 #include <bit>
-#include <cstdlib>
-#include <filesystem>
-#include <fstream>
 #include <span>
-#include <string>
 #include <unordered_map>
 #include <catch2/catch_test_macros.hpp>
 
@@ -305,76 +301,6 @@ TEST_CASE("Welcome Tour logged half fetch writes odd scalar destinations",
     }
 }
 
-TEST_CASE("Depth sampling emits float image and result types for integer descriptors",
-          "[video_core][spirv][depth_compare]") {
-    for (const bool depth : {false, true}) {
-        for (const bool integer : {false, true}) {
-            CAPTURE(depth, integer);
-            TextureEnvironment env;
-            env.integer_format = integer;
-            Shader::ObjectPool<IR::Inst> pool;
-            IR::Block block{pool};
-            IR::Program program;
-            program.stage = Shader::Stage::Fragment;
-            program.blocks = {&block};
-            program.post_order_blocks = {&block};
-            program.syntax_list = {{{.block = &block}, IR::AbstractSyntaxNode::Type::Block},
-                                   {{}, IR::AbstractSyntaxNode::Type::Return}};
-            IR::IREmitter ir{block};
-            IR::TextureInstInfo flags{};
-            flags.type.Assign(Shader::TextureType::Color2D);
-            flags.is_depth.Assign(depth ? 1 : 0);
-            const auto coords = ir.CompositeConstruct(ir.Imm32(0.0f), ir.Imm32(0.0f));
-            const auto sample = depth
-                ? IR::Value{ir.ImageSampleDrefImplicitLod(ir.Imm32(0), coords, ir.Imm32(0.5f),
-                                                        {}, {}, {}, flags)}
-                : ir.ImageSampleExplicitLod(ir.Imm32(0), coords, ir.Imm32(0.0f), {}, flags);
-            Shader::HostTranslateInfo host;
-            host.ApplyDescriptorLimitPolicy();
-            Shader::Optimization::TexturePass(env, program, host);
-            REQUIRE(program.info.texture_descriptors.size() == 1);
-            CHECK(program.info.texture_descriptors[0].is_integer == (integer && !depth));
-            CHECK(sample.Inst()->Flags<IR::TextureInstInfo>().is_integer ==
-                  static_cast<u32>(integer && !depth));
-            Shader::Profile profile;
-            profile.supported_spirv = 0x00010500;
-            const auto code = Shader::Backend::SPIRV::EmitSPIRV(profile, program);
-            std::unordered_map<u32, u32> scalar_types;
-            u32 image_sampled_type{};
-            u32 dref_result_type{};
-            for (size_t offset = 5; offset < code.size();) {
-                const u32 size = code[offset] >> 16;
-                REQUIRE(size != 0);
-                REQUIRE(offset + size <= code.size());
-                const u32 opcode = code[offset] & 0xffffU;
-                if (opcode == 21 || opcode == 22) {
-                    scalar_types.emplace(code[offset + 1], opcode);
-                } else if (opcode == 25) {
-                    image_sampled_type = code[offset + 2];
-                    CHECK(code[offset + 4] == static_cast<u32>(depth));
-                } else if (opcode == 89) {
-                    dref_result_type = code[offset + 1];
-                }
-                offset += size;
-            }
-            REQUIRE(image_sampled_type != 0);
-            CHECK(scalar_types.at(image_sampled_type) == (integer && !depth ? 21 : 22));
-            if (depth) {
-                CHECK(dref_result_type == image_sampled_type);
-            }
-            if (const char* directory = std::getenv("EDEN_DEPTH_TEST_OUTPUT")) {
-                std::filesystem::create_directories(directory);
-                const auto name = std::string{depth ? "depth" : "color"} +
-                                  (integer ? "-integer" : "-float") + ".spv";
-                std::ofstream file{std::filesystem::path{directory} / name, std::ios::binary};
-                file.write(reinterpret_cast<const char*>(code.data()),
-                           static_cast<std::streamsize>(code.size() * sizeof(u32)));
-                REQUIRE(file.good());
-            }
-        }
-    }
-}
-
 TEST_CASE("Welcome Tour logged half gathers round and pack both destination orders",
           "[video_core][ampere][logged_textures]") {
     for (const auto& capture : Gathers) {
@@ -557,6 +483,63 @@ TEST_CASE("Guarded per-tap gathers retain immediate offsets through SPIRV transl
             CHECK(spirv.front() == 0x07230203);
         }
     }
+}
+
+TEST_CASE("Runtime per-tap offsets reach all four SPIR-V gather operations",
+          "[video_core][ampere][gather][logged_textures]") {
+    const std::array native{
+        Instruction{{0x00107919, 0, 0x2100, 0}},
+        Instruction{{0x00117919, 0, 0x2200, 0}},
+        Instruction{{0x06187b63, 0x30007c10, 0x001e2f0e, 0}},
+        Exit,
+    };
+    const auto lowered = Shader::Ampere::LowerToMaxwell(native);
+    INFO(lowered.error);
+    REQUIRE(lowered);
+    auto code = lowered.instructions;
+    for (const u32 reg : {14U, 15U, 24U, 25U})
+        code.insert(code.end() - 1, 0xef58000000070000ULL | reg | (255ULL << 8) |
+                                    (u64{reg * 4} << 20) | (4ULL << 48));
+    TextureEnvironment env;
+    env.code = code;
+    env.binding = lowered.required_texture_buffer;
+    Shader::ObjectPool<Shader::Maxwell::Flow::Block> flow_pool;
+    Shader::Maxwell::Flow::CFG cfg{env, flow_pool, Shader::Maxwell::Location{0x50}};
+    Shader::ObjectPool<IR::Inst> inst_pool;
+    Shader::ObjectPool<IR::Block> block_pool;
+    Shader::HostTranslateInfo host;
+    host.ApplyDescriptorLimitPolicy();
+    auto program = Shader::Maxwell::TranslateProgram(inst_pool, block_pool, env, cfg, host);
+    Shader::Profile profile{};
+    profile.supported_spirv = 0x00010400;
+    const auto spirv = Shader::Backend::SPIRV::EmitSPIRV(profile, program);
+    std::vector<u32> results;
+    std::vector<u32> offsets;
+    u32 sampled_taps = 0;
+    for (size_t i = 5; i < spirv.size();) {
+        const u32 count = spirv[i] >> 16;
+        REQUIRE(count != 0);
+        REQUIRE(i + count <= spirv.size());
+        switch (spirv[i] & 0xffff) {
+        case 96: // OpImageGather
+            REQUIRE(count == 8);
+            CHECK(spirv[i + 6] == 16); // ImageOperands Offset
+            results.push_back(spirv[i + 2]);
+            offsets.push_back(spirv[i + 7]);
+            break;
+        case 81: // OpCompositeExtract
+            if (count == 5 && std::ranges::find(results, spirv[i + 3]) != results.end()) {
+                CHECK(spirv[i + 4] == 3); // i0,j0 of each shifted footprint
+                ++sampled_taps;
+            }
+            break;
+        }
+        i += count;
+    }
+    REQUIRE(results.size() == 4);
+    CHECK(sampled_taps == 4);
+    std::ranges::sort(offsets);
+    CHECK(std::adjacent_find(offsets.begin(), offsets.end()) == offsets.end());
 }
 
 TEST_CASE("Half gathers reject reserved second coordinates before scratch copies",

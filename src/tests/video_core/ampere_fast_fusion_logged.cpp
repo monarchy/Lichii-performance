@@ -347,6 +347,7 @@ struct HalfIR {
     HalfEnvironment env;
     std::array<u32, IR::NUM_REGS> registers{};
     std::unordered_map<const IR::Inst*, u64> values;
+    std::unordered_map<u64, u32> constants;
 
     explicit HalfIR(std::span<const u64> code) {
         Shader::Maxwell::TranslatorVisitor visitor{env, block};
@@ -359,6 +360,8 @@ struct HalfIR {
                 visitor.I2F_reg(word);
             else if ((word >> 48) == 0x5c60)
                 visitor.FMNMX_reg(word);
+            else if ((word >> 48) == 0x4c98)
+                visitor.MOV_cbuf(word);
             else if ((word >> 48) == 0x5c98)
                 visitor.MOV_reg(word);
             else if ((word >> 48) == 0x5c28)
@@ -424,6 +427,8 @@ struct HalfIR {
             return 0;
         case IR::Opcode::Identity:
             return a(0);
+        case IR::Opcode::GetCbufU32:
+            return constants.at((a(0) << 32) | a(1));
         case IR::Opcode::GetRegister:
             return registers.at(static_cast<size_t>(inst.Arg(0).Reg()));
         case IR::Opcode::BitCastF32U32:
@@ -725,6 +730,33 @@ TEST_CASE("Ampere F2I signed byte clamps to the byte range", "[video_core][amper
              std::pair{std::numeric_limits<f32>::quiet_NaN(), 0U}}) {
         CAPTURE(input);
         CHECK(translation.Run(std::bit_cast<u32>(input), 5, 9) == expected);
+    }
+}
+
+TEST_CASE("Constant-buffer F2I applies absolute then negation before byte and halfword conversion",
+          "[video_core][ampere]") {
+    const Instruction byte{{0x00157b05, 0x00400400, 0x0021e100, 0x0001e400}};
+    const Instruction halfword{{0x00067b05, 0x00c03400, 0x00212800, 0x000e2200}};
+    for (const bool is_byte : {false, true}) {
+        for (const u32 modifiers : {0U, 1U, 2U, 3U}) {
+            auto instruction = is_byte ? byte : halfword;
+            instruction.words[1] |= modifiers << 30;
+            const auto lowered = LowerToMaxwell(std::array{instruction, Exit});
+            REQUIRE(lowered);
+            HalfIR machine{lowered.instructions};
+            for (const float input : {-70000.0f, -13.75f, 13.75f, 70000.0f}) {
+                CAPTURE(is_byte, modifiers, input);
+                // c[1][0x10] for the S8 form and c[3][0xd0] for Pokopia's U16 form.
+                machine.constants[is_byte ? (1ULL << 32) | 0x10 : (3ULL << 32) | 0xd0] =
+                    std::bit_cast<u32>(input);
+                float value = (modifiers & 1) ? std::abs(input) : input;
+                if (modifiers & 2) value = -value;
+                const s32 expected = is_byte
+                    ? static_cast<s32>(std::clamp(std::trunc(value), -128.0f, 127.0f))
+                    : static_cast<s32>(std::clamp(std::nearbyint(value), 0.0f, 65535.0f));
+                CHECK(machine.Run(0, 2, is_byte ? 21 : 6) == static_cast<u32>(expected));
+            }
+        }
     }
 }
 

@@ -299,23 +299,31 @@ class CliTests(unittest.TestCase):
         self.run_cli(source, "--lower-only", self.output, "--timings", code=2)
         self.assertFalse(self.output.exists())
 
-    def test_captured_task_and_mesh_require_complete_v53_context(self):
-        for stage, name, model in ((7, "task", 5364), (8, "mesh", 5365)):
-            with self.subTest(stage=name):
-                capture = self.write("shader.env", environment(53, stage))
-                result = self.run_cli("--environment", capture, "--cache-version", 53,
-                                      "--output", self.output)
-                self.assertEqual(result["stage"], name)
-                self.assertTrue(any("linkage is not validated" in item for item in result["assumptions"]))
-                models = [args[0] for op, args in spirv_instructions(self.output.read_bytes()) if op == 15]
-                self.assertEqual(models, [model])
-                self.validate()
-                capture.write_bytes(environment(52, stage))
-                result = self.run_cli("--environment", capture, "--cache-version", 52,
-                                      "--output", self.output, code=1)
-                self.assertEqual(result["error"]["code"], "missing_context")
-                capture.write_bytes(environment(53, stage)[:-1])
-                self.run_cli("--environment", capture, "--cache-version", 53,
+    def test_captured_task_and_mesh_require_complete_context(self):
+        for version in (53, 54):
+            for stage, name, model in ((7, "task", 5364), (8, "mesh", 5365)):
+                with self.subTest(version=version, stage=name):
+                    capture = self.write("shader.env", environment(version, stage))
+                    result = self.run_cli("--environment", capture, "--cache-version", version,
+                                          "--output", self.output)
+                    self.assertEqual(result["stage"], name)
+                    self.assertTrue(any("linkage is not validated" in item for item in result["assumptions"]))
+                    models = [args[0] for op, args in spirv_instructions(self.output.read_bytes()) if op == 15]
+                    self.assertEqual(models, [model])
+                    self.validate()
+                    capture.write_bytes(environment(52, stage))
+                    result = self.run_cli("--environment", capture, "--cache-version", 52,
+                                          "--output", self.output, code=1)
+                    self.assertEqual(result["error"]["code"], "missing_context")
+                    capture.write_bytes(environment(version, stage)[:-1])
+                    self.run_cli("--environment", capture, "--cache-version", version,
+                                 "--output", self.output, code=2)
+
+    def test_unknown_cache_versions_are_rejected(self):
+        capture = self.write("shader.env", environment(54, 4))
+        for version in ("0", "45", "55", "54x"):
+            with self.subTest(version=version):
+                self.run_cli("--environment", capture, "--cache-version", version,
                              "--output", self.output, code=2)
 
     def test_vertex_a_still_requires_pipeline_linkage(self):
@@ -367,7 +375,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(sum(op == 218 for op, _ in emitted), 1)
 
     def test_both_cache_versions_all_stages(self):
-        for version in (46, 47, 48, 49, 50, 51, 52, 53):
+        for version in (46, 47, 48, 49, 50, 51, 52, 53, 54):
             for stage, name in enumerate(STAGES):
                 with self.subTest(version=version, stage=name):
                     capture = self.write("shader.env", environment(version, stage))

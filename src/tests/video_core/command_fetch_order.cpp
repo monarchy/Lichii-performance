@@ -5,6 +5,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "video_core/command_fetch_order.h"
+#include "video_core/dma_pusher.h"
 #include "video_core/nx2.h"
 
 TEST_CASE("First queued GPU command write is visible before snapshot selection",
@@ -100,4 +101,29 @@ TEST_CASE("Synchronization failure cannot fall through to stale command words",
         [&] { flushed = true; }), int);
     REQUIRE_FALSE(checked);
     REQUIRE_FALSE(flushed);
+}
+
+TEST_CASE("Incrementing front packets stop before macros and continue across fetched segments",
+          "[video_core][front_batch]") {
+    Tegra::DmaPusher::DmaState packet{};
+    packet.method = 0x40;
+    packet.method_count = 7;
+    REQUIRE(packet.FrontRegisterRunLength(7) == 0);
+    packet.front_batch = true;
+    CHECK(packet.FrontRegisterRunLength(3) == 3);
+    packet.method += 3;
+    packet.method_count -= 3;
+    CHECK(packet.FrontRegisterRunLength(99) == 4);
+    CHECK(packet.FrontRegisterRunLength(1) == 0);
+    CHECK(packet.FrontRegisterRunLength(0) == 0);
+    packet.method = 0x3f;
+    CHECK(packet.FrontRegisterRunLength(4) == 0);
+    packet.method = Tegra::DmaPusher::MacroRegistersStart - 2;
+    CHECK(packet.FrontRegisterRunLength(4) == 2);
+    ++packet.method;
+    CHECK(packet.FrontRegisterRunLength(4) == 0);
+    ++packet.method;
+    CHECK(packet.FrontRegisterRunLength(4) == 0);
+    ++packet.method;
+    CHECK(packet.FrontRegisterRunLength(4) == 0);
 }

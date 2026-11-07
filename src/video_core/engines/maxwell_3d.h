@@ -34,6 +34,7 @@ class System;
 }
 
 namespace Tegra {
+union CommandHeader;
 class MemoryManager;
 }
 
@@ -3214,6 +3215,10 @@ public:
                          u32 argument, bool is_last_call);
     void FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
                               const u32* base_start, u32 amount, u32 methods_pending);
+    /// Applies an incrementing run below the macro range as individual FrontCallMethod writes.
+    /// The last word ends the packet only when this run reaches the packet's declared length.
+    void FrontWriteRun(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
+                       std::span<const CommandHeader> words, bool ends_method);
 
     bool ShouldExecute() const {
         return execute_on;
@@ -3397,6 +3402,7 @@ private:
     // the front owns the macro code and bindings (the back thread then leaves them alone).
     struct FrontState;
     FrontState& Front(Core::System& system, VideoCommon::GpuSplit& split);
+    void ReleaseFront();
     void FrontWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
                     bool is_last_call, bool from_macro);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);

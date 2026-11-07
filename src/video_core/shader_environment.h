@@ -33,6 +33,8 @@ namespace VideoCommon {
 /// A native (Switch 2) program after capture and lowering to Maxwell code. The shader cache keeps
 /// it so the environments built for the program's pipelines don't capture and lower it again.
 struct LoweredNativeCode {
+    u64 diagnostic_key{};
+    /// Shader::Ampere::NativeProgramKey of the captured program (shader dump file names).
     u64 native_program_key{};
     /// Shader header, lowered instructions with Maxwell scheduling words, then the native
     /// address map (what the environment's `code` used to be filled with).
@@ -98,6 +100,13 @@ public:
 
     void Serialize(std::ofstream& file) const;
 
+    /// Native programs: the constant buffer slots (index << 32 | offset) storage tracking took as
+    /// pointers, and the ones it left out because they held null when the program was translated.
+    void StoragePointerSlots(std::vector<u64>& pointers, std::vector<u64>& null_slots) const;
+
+    /// Takes these slots as pointers without reading them: a rebuild keeps its earlier buffers.
+    void SeedStoragePointers(std::span<const u64> slots);
+
     bool HasHLEMacroState() const override {
         return has_hle_engine_state;
     }
@@ -113,6 +122,10 @@ protected:
     std::shared_ptr<const LoweredNativeCode> LowerNativeCode(u32 source_header_size,
                                                           bool geometry_stage);
     size_t native_source_size{};
+    /// Lower matrix multiplies too (KeplerCompute::EmulatesNativeTensorPrograms).
+    bool native_tensor{};
+    /// ... in the compact form (KeplerCompute::UsesCompactTensorPrograms).
+    bool native_compact_tensor{};
     std::shared_ptr<const LoweredNativeCode> lowered_native;
 
     Tegra::Texture::TICEntry ReadTextureInfo(GPUVAddr tic_addr, u32 tic_limit,
@@ -219,6 +232,9 @@ public:
     FileEnvironment(const FileEnvironment&) = delete;
 
     void Deserialize(std::ifstream& file);
+
+    /// See GenericEnvironment::StoragePointerSlots.
+    void StoragePointerSlots(std::vector<u64>& pointers, std::vector<u64>& null_slots) const;
 
     [[nodiscard]] size_t MemorySize() const;
 

@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstdlib>
 #include <deque>
 #include <map>
 #include <optional>
@@ -1318,7 +1319,12 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
         !env.IsCbufStorageBufferPointer(storage_buffer->index, storage_buffer->offset)) {
         storage_buffer.reset();
     }
-    if (native && !storage_buffer && !low_addr.IsImmediate()) {
+    // A paired constant buffer pointer can be only one input of a select or phi whose other input
+    // is a pointer loaded from that buffer (Ocarina of Time's foliage unit placement records are
+    // read from c0[12] or from *c0[12]). Rebasing on the constant buffer pointer then reads the
+    // loaded path's records out of bounds, as zeros, so look for loaded pointers here as well.
+    const bool paired_found = storage_buffer.has_value();
+    if (native && !low_addr.IsImmediate()) {
         const IR::Inst* const start{low_addr.InstRecursive()};
         auto it{info.native_candidates.find(start)};
         if (it == info.native_candidates.end()) {
@@ -1331,10 +1337,22 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
             }
         }
         const auto& candidates{it->second};
-        if (candidates.size() > 1 || (!candidates.empty() && info.native_dynamic.contains(start))) {
+        const bool has_loaded_pointer{std::ranges::any_of(
+            candidates, [](const StorageBufferAddr& c) { return c.indirect != ~0U; })};
+        if (paired_found && !has_loaded_pointer) {
+            // No pointer loaded from memory competes with the paired one: keep the pair.
+        } else if (candidates.size() > 1 || paired_found ||
+                   (!candidates.empty() && info.native_dynamic.contains(start))) {
             // Bind every candidate and keep the access global; the backend picks the buffer at
             // run time. Rebasing on one of them drops the other path's accesses.
             bool accepted{};
+            if (paired_found) {
+                // The paired pointer is the other input of the select or phi; bind it too.
+                info.set.insert(*storage_buffer);
+                if (IsGlobalMemoryWrite(inst)) {
+                    info.writes.insert(*storage_buffer);
+                }
+            }
             for (const StorageBufferAddr& candidate : candidates) {
                 if (std::ranges::find(info.table_candidates, candidate) !=
                     info.table_candidates.end()) {
@@ -1366,7 +1384,7 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
                 return;
             }
             // Only table entries, and no free binding for them: as if none had been found.
-        } else if (candidates.size() == 1) {
+        } else if (candidates.size() == 1 && !paired_found) {
             // The one pointer the address is built from. The NVN search below only takes 16-byte
             // aligned slots, so for a pointer at an 8-byte slot it can return a dimension or stride
             // the address arithmetic reads instead, and the access then lands in the wrong buffer.
@@ -1552,6 +1570,14 @@ void Replace(IR::Block& block, IR::Inst& inst, const IR::U32& storage_index,
 }
 } // Anonymous namespace
 
+size_t StorageBufferLimit(Stage stage) {
+    static const bool wide_compute = [] {
+        const char* const value = std::getenv("EDEN_NX2_WIDE_COMPUTE_SSBOS");
+        return !(value && value[0] == '0');
+    }();
+    return stage == Stage::Compute && wide_compute ? Info::MAX_SSBOS : Info::MAX_GRAPHICS_SSBOS;
+}
+
 void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
                                      const HostTranslateInfo& host_info) {
     const bool has_global_memory =
@@ -1577,15 +1603,25 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
         }
     };
     collect();
-    if (info.tables_seen && info.set.size() < Info::MAX_SSBOS) {
+    // Compute programs may bind up to Info::MAX_SSBOS (64) storage buffers, so pointer table
+    // entries still fit when the program's own pointers take most of 32. Ocarina of Time's foliage
+    // list builder has 29 of its own: the table entries of its last two sections (Hyrule Field
+    // grass) did not fit, read zeros and the grass list stayed empty.
+    // EDEN_NX2_WIDE_COMPUTE_SSBOS=0 restores the 32-binding limit.
+    const size_t max_ssbos = StorageBufferLimit(env.ShaderStage());
+    if (info.tables_seen && info.set.size() < max_ssbos) {
         // Again with pointer table entries, in the bindings the first pass left free.
         StorageInfo with_tables;
         with_tables.iterator_words = std::move(info.iterator_words);
         with_tables.atomic_pointers = std::move(info.atomic_pointers);
         with_tables.tables_enabled = true;
-        with_tables.table_budget = Info::MAX_SSBOS - info.set.size();
+        with_tables.table_budget = max_ssbos - info.set.size();
         info = std::move(with_tables);
         collect();
+    }
+    if (info.set.size() > max_ssbos) {
+        throw NotImplementedException("{} storage buffers, the limit is {}", info.set.size(),
+                                      max_ssbos);
     }
     program.info.native_global_bounds |= info.native_runtime_bounds;
     for (const StorageBufferAddr& storage_buffer : info.set) {
@@ -1622,6 +1658,11 @@ void JoinStorageInfo(Info& base, Info& source) {
         if (it != descriptors.end()) {
             it->is_written |= desc.is_written;
             continue;
+        }
+        // Both vertex programs share one graphics-stage binding array.
+        if (descriptors.size() >= Info::MAX_GRAPHICS_SSBOS) {
+            throw NotImplementedException("Merged vertex program exceeds {} storage buffers",
+                                          Info::MAX_GRAPHICS_SSBOS);
         }
         descriptors.push_back(desc);
     }

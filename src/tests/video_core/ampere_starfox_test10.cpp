@@ -89,6 +89,15 @@ u32 ConvertUniformHalfword(u64 word, u32 source_register, u32 input) {
             REQUIRE(static_cast<u32>(inst.Arg(0).Reg()) == source_register);
             result = input;
             break;
+        case IR::Opcode::BitFieldSExtract:
+            REQUIRE(arg(2) == 16);
+            REQUIRE(arg(1) <= 16);
+            result = static_cast<u32>(static_cast<s16>(arg(0) >> arg(1)));
+            break;
+        case IR::Opcode::ConvertF32S32:
+            CHECK(inst.Flags<IR::FpControl>().rounding == IR::FpRounding::RN);
+            result = std::bit_cast<u32>(static_cast<float>(static_cast<s32>(arg(0))));
+            break;
         case IR::Opcode::BitFieldUExtract:
             REQUIRE(arg(2) == 16);
             REQUIRE(arg(1) <= 16);
@@ -169,6 +178,16 @@ struct Translation {
                 const auto arg = [&](size_t index) { return read(inst.Arg(index))[0]; };
                 Vector result{};
                 switch (inst.GetOpcode()) {
+                case IR::Opcode::GetCbufS8:
+                case IR::Opcode::GetCbufS16: {
+                    REQUIRE(arg(0) == 6);
+                    const u32 element = constants.at(arg(1) & ~3U) >> ((arg(1) & 3) * 8);
+                    result[0] = inst.GetOpcode() == IR::Opcode::GetCbufS8
+                                    ? static_cast<u32>(static_cast<s8>(element))
+                                    : static_cast<u32>(static_cast<s16>(element));
+                    ++constant_reads;
+                    break;
+                }
                 case IR::Opcode::GetCbufU16:
                     REQUIRE(arg(0) == 6);
                     REQUIRE((arg(1) & 1) == 0);
@@ -318,7 +337,6 @@ TEST_CASE("Star Fox ULDC U16 rejects unrepresentable offsets and unsupported mod
              std::array{38U, 16U, 0x8000U}, std::array{38U, 16U, 0xfffeU},
              std::array{16U, 8U, 63U}, std::array{16U, 8U, 64U},
              std::array{54U, 5U, 18U}, std::array{62U, 2U, 1U},
-             std::array{73U, 3U, 1U}, std::array{73U, 3U, 3U},
              std::array{73U, 3U, 6U}, std::array{78U, 2U, 2U},
              std::array{91U, 1U, 1U}}) {
         auto instruction = CapturedUniformLoad;
@@ -334,8 +352,32 @@ TEST_CASE("Star Fox ULDC U16 rejects unrepresentable offsets and unsupported mod
     const auto indexed_load = LowerToMaxwell(std::array{indexed, Exit});
     INFO(indexed_load.error);
     CHECK(indexed_load);
-    SetBits(indexed, 73, 3, 1);
-    CHECK_FALSE(LowerToMaxwell(std::array{indexed, Exit}));
+}
+
+TEST_CASE("Signed uniform byte and halfword loads extend the selected element",
+          "[video_core][ampere][starfox_uldc]") {
+    for (const bool indexed : {false, true}) {
+        for (const u32 width : {1U, 3U}) {
+            auto instruction = CapturedUniformLoad;
+            SetBits(instruction, 73, 3, width);
+            if (indexed) {
+                SetBits(instruction, 0, 12, 0xabb);
+                SetBits(instruction, 91, 1, 1);
+            }
+            const auto lowered = LowerToMaxwell(std::array{instruction, Exit});
+            REQUIRE(lowered);
+            for (const u32 value : {0x7fa5U, 0x80a5U, 0x1234U}) {
+                Translation translated;
+                translated.registers[216] = indexed ? 4 : 0;
+                translated.constants.emplace(indexed ? 0x24 : 0x20, value);
+                translated.Run(lowered);
+                const u32 expected = width == 1 ? static_cast<u32>(static_cast<s8>(value))
+                                                : static_cast<u32>(static_cast<s16>(value));
+                CHECK(translated.registers[220] == expected);
+                CHECK(translated.constant_reads == 1);
+            }
+        }
+    }
 }
 
 TEST_CASE("Star Fox Test10 uniform U16 conversion reaches the real translator",
@@ -365,6 +407,11 @@ TEST_CASE("Star Fox upstream U16 port keeps selectors uniform mapping and signed
             REQUIRE(lowered.instructions.size() == 2);
             CHECK(ConvertUniformHalfword(lowered.instructions.front(), mapped, 0x8001ffffU) ==
                   std::bit_cast<u32>(static_cast<float>(half == 0 ? 65535 : 32769)));
+            SetBits(instruction, 74, 1, 1);
+            const auto signed_half = LowerToMaxwell(std::array{instruction, Exit});
+            REQUIRE(signed_half);
+            CHECK(ConvertUniformHalfword(signed_half.instructions.front(), mapped, 0x8001ffffU) ==
+                  std::bit_cast<u32>(static_cast<float>(half == 0 ? -1 : -32767)));
         }
     }
     for (const u32 sign : {0U, 1U}) {
@@ -393,7 +440,7 @@ TEST_CASE("Star Fox uniform U16 conversion rejects invalid uniform sources and o
         CHECK_FALSE(lowered);
         CHECK(lowered.instructions.empty());
     }
-    for (const u32 mode : {0x00101000U, 0x08101400U, 0x08109000U, 0x08100800U}) {
+    for (const u32 mode : {0x00101000U, 0x08109000U, 0x08100800U}) {
         auto instruction = CapturedI2F;
         instruction.words[2] = mode;
         const auto lowered = LowerToMaxwell(std::array{instruction, Exit});
@@ -540,7 +587,7 @@ TEST_CASE("Star Fox array gather rejects unsupported modes and scratch crossings
              std::array{60U, 1U, 0U}, std::array{61U, 3U, 7U}, std::array{76U, 2U, 1U},
              std::array{76U, 2U, 2U}, std::array{78U, 1U, 1U}, std::array{79U, 1U, 1U},
              std::array{80U, 1U, 1U}, std::array{81U, 3U, 0U}, std::array{72U, 4U, 3U},
-             std::array{24U, 8U, 245U}, std::array{32U, 8U, 255U}, std::array{64U, 8U, 245U},
+             std::array{24U, 8U, 245U}, std::array{32U, 8U, 246U}, std::array{64U, 8U, 245U},
              std::array{64U, 8U, 28U}, std::array{0U, 12U, 0xf63U}}) {
         auto instruction = CapturedGather;
         SetBits(instruction, change[0], change[1], change[2]);
@@ -548,6 +595,16 @@ TEST_CASE("Star Fox array gather rejects unsupported modes and scratch crossings
         CHECK_FALSE(lowered);
         CHECK(lowered.instructions.empty());
     }
+    auto zero_y = CapturedGather;
+    SetBits(zero_y, 32, 8, 255);
+    const auto zero_gather = LowerToMaxwell(std::array{zero_y, Exit});
+    REQUIRE(zero_gather);
+    Translation translated;
+    translated.registers[32] = 3;
+    translated.registers[33] = 0x3f800000;
+    translated.Run(zero_gather);
+    CHECK(translated.coordinates == Translation::Vector{0x3f800000, 0U, 0x40400000});
+
     auto instruction = CapturedGather;
     SetBits(instruction, 24, 8, 215);
     const auto lowered = LowerToMaxwell(std::array{CapturedI2F, instruction, Exit});

@@ -8,6 +8,7 @@
 #include <span>
 #include <vector>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include "video_core/buffer_cache/uniform_stream_reuse.h"
 
@@ -19,8 +20,17 @@ void Check(bool condition, const char* message) {
 
 struct Memory {
     std::array<u8, 8192> bytes{};
+    bool contiguous{true};
+    u32 reads{};
+    u32 span_requests{};
+    const u8* GetSpan(u64 address, u32 size) {
+        Check(address + size <= bytes.size(), "span outside guest memory");
+        ++span_requests;
+        return contiguous ? bytes.data() + address : nullptr;
+    }
     void ReadBlockUnsafe(u64 address, void* destination, u32 size) {
         Check(address + size <= bytes.size(), "read outside guest memory");
+        ++reads;
         std::memcpy(destination, bytes.data() + address, size);
     }
 };
@@ -32,6 +42,7 @@ struct Runtime {
     std::vector<std::vector<u8>> allocations;
     StreamUniformRef last{}, bound{};
     u64 tick{1};
+    Memory* mutate_on_allocation{};
     u64 CurrentTick() const {
         return tick;
     }
@@ -39,6 +50,9 @@ struct Runtime {
         return last;
     }
     std::span<u8> BindMappedUniformBuffer(size_t, u32, u32 size) {
+        if (mutate_on_allocation) {
+            mutate_on_allocation->bytes[7] ^= u8{0x5a};
+        }
         allocations.emplace_back(size);
         last = bound = StreamUniformRef{allocations.size() - 1};
         return allocations.back();
@@ -63,13 +77,14 @@ void CheckBound(const Runtime& runtime, const Memory& memory, u64 address, u32 s
 } // namespace
 
 TEST_CASE("Uniform stream reuse preserves data through mutation and session resets",
-          "[video_core]") {
+          "[video_core][uniform_stream_reuse]") {
     using VideoCommon::BindSmallUniformReusing;
+    bool direct = GENERATE(false, true);
     Memory memory;
     Runtime runtime;
     VideoCommon::ResetUniformStreamReuse<Runtime>();
     auto bind = [&](size_t stage, u32 slot, u64 address, u32 size) {
-        Check(BindSmallUniformReusing(runtime, memory, stage, slot, slot, address, size),
+        Check(BindSmallUniformReusing(runtime, memory, stage, slot, slot, address, size, direct),
               "valid small uniform rejected");
         CheckBound(runtime, memory, address, size);
     };
@@ -92,7 +107,7 @@ TEST_CASE("Uniform stream reuse preserves data through mutation and session rese
     const auto before = runtime.allocations.size();
     for (auto [stage, slot, size] :
          {std::array<u32, 3>{5, 0, 64}, {0, 18, 64}, {0, 0, 0}, {0, 0, 4097}}) {
-        Check(!BindSmallUniformReusing(runtime, memory, stage, slot, slot, 0, size),
+        Check(!BindSmallUniformReusing(runtime, memory, stage, slot, slot, 0, size, direct),
               "invalid uniform range did not use the fallback");
     }
     Check(runtime.allocations.size() == before, "fallback allocated stream memory");
@@ -111,6 +126,45 @@ TEST_CASE("Uniform stream reuse preserves data through mutation and session rese
         const size_t stage = (random >> 20) % 5;
         const u32 slot = (random >> 24) % 18;
         bind(stage, slot, address, size);
+        direct = !direct;
         bind(stage, slot, address, size);
+    }
+}
+
+TEST_CASE("Direct uniform comparison falls back for fragmented memory and keeps one snapshot",
+          "[video_core][uniform_stream_direct]") {
+    using VideoCommon::BindSmallUniformReusing;
+    Memory memory;
+    Runtime runtime;
+    VideoCommon::ResetUniformStreamReuse<Runtime>();
+
+    REQUIRE(BindSmallUniformReusing(runtime, memory, 0, 0, 0, 0, 64, true));
+    REQUIRE(memory.reads == 0);
+    CheckBound(runtime, memory, 0, 64);
+    REQUIRE(BindSmallUniformReusing(runtime, memory, 0, 0, 0, 0, 64, true));
+    REQUIRE(runtime.allocations.size() == 1);
+    memory.contiguous = false;
+    memory.bytes[7] = 23;
+    REQUIRE(BindSmallUniformReusing(runtime, memory, 0, 0, 0, 0, 64, true));
+    REQUIRE(memory.reads == 1);
+    CheckBound(runtime, memory, 0, 64);
+
+    for (const bool direct : {false, true}) {
+        CAPTURE(direct);
+        VideoCommon::ResetUniformStreamReuse<Runtime>();
+        memory.contiguous = true;
+        memory.bytes[7] = 23;
+        runtime.mutate_on_allocation = &memory;
+        REQUIRE(BindSmallUniformReusing(runtime, memory, 0, 0, 0, 0, 64, direct));
+        runtime.mutate_on_allocation = nullptr;
+        REQUIRE(runtime.allocations.back()[7] == 23);
+        REQUIRE(memory.bytes[7] != 23);
+        const auto before = runtime.allocations.size();
+        REQUIRE(BindSmallUniformReusing(runtime, memory, 0, 0, 0, 0, 64, direct));
+        REQUIRE(runtime.allocations.size() == before + 1);
+        CheckBound(runtime, memory, 0, 64);
+        runtime.NextTick();
+        REQUIRE(BindSmallUniformReusing(runtime, memory, 0, 0, 0, 0, 64, direct));
+        CheckBound(runtime, memory, 0, 64);
     }
 }

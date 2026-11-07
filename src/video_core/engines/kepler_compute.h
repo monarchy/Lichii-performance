@@ -66,6 +66,8 @@ public:
     /// Binds a rasterizer to this engine.
     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
 
+    /// Whether a write to `method` can write memory (a dispatch, upload or report): with the
+    /// native class, every method besides those that only store their value; macros always.
     [[nodiscard]] bool MayWriteMemory(u32 method) const {
         if (method >= native_plain_methods.size()) {
             return true;
@@ -255,6 +257,16 @@ public:
     bool ProcessGameDlss(u64 program_id, u64 native_key);
     void TraceDlssContract(u64 native_key, bool warn_unvalidated = true);
 
+    /// Whether the dispatch being run is a pass of a game DLSS evaluation (Fortune's Weave).
+    bool IsDlssDispatch() const { return native_mode && dlss_chain.active; }
+    /// Whether the matrix multiplies (tensor-core instructions) of the program being dispatched
+    /// are emulated: in a game DLSS evaluation when the game's own network may draw, and always
+    /// for Donkey Kong Bananza and Ocarina of Time.
+    [[nodiscard]] bool EmulatesNativeTensorPrograms() const;
+    /// Whether those matrix multiplies use the compact software form (one shared helper per
+    /// program) instead of the inline expansion: Ocarina of Time's network.
+    [[nodiscard]] bool UsesCompactTensorPrograms() const;
+
     /// GPU thread split with macros on its front half (gpu_split.h, EDEN_NX2_SPLIT=2), called by
     /// the front instead of CallMethod for native compute engines: runs their macros and macro
     /// uploads against a copy of the registers and sends the register writes to the back.
@@ -268,6 +280,7 @@ public:
 private:
     struct FrontState;
     FrontState& Front(VideoCommon::GpuSplit& split);
+    void ReleaseFront();
     void FrontApply(FrontState& state, u32 method, u32 argument);
     MacroEngine& FrontMacroEngine(FrontState& state);
     std::span<u32> FrontMacroPositions(FrontState& state);
@@ -285,6 +298,11 @@ private:
     void CheckDlssNetwork();
     [[nodiscard]] VideoCore::GameDlssReason GameDlssBlocker() const;
     void UpdateGameDlssStatus(bool complete, VideoCore::GameDlssReason blocker);
+    std::pair<std::vector<u32>, std::vector<u32>> NativeImageHandles(GPUVAddr program);
+    void RememberNativeUpscaleInput();
+    bool ReadConstBufferWords(u32 slot, std::vector<u32>& words) const;
+    void FollowPhotoUpscale();
+    bool UpscaleFromConstBuffers();
 
     /// This frame's DLSS evaluation (Fortune's Weave): whether its passes all ran, and whether
     /// the game's own network output is shown instead of the replacement upscale.
@@ -313,6 +331,30 @@ private:
         /// What the Graphics tab was last told.
         VideoCore::GameDlssStatus status{};
     } dlss_chain;
+
+    /// Ocarina of Time's movie network: a pass that reads one colour image and stores none
+    /// retains its input here; the pass that stores an image upscaling it is replaced by a plain
+    /// copy (the network's matrix passes cost seconds per frame on Pascal-class GPUs). Cleared
+    /// after the copy.
+    std::optional<Texture::TICEntry> native_upscale_input;
+    /// Native dispatches left to skip while a retained network is being replaced (bounded, so a
+    /// non-network pass cannot silence the engine forever).
+    u32 network_skip_remaining{};
+
+    /// Mario Kart World's docked photo mode upscales 2560x1440 to 3840x2160 with a tensor-core
+    /// network whose passes can't run. After its first rejected pass the next dispatches are
+    /// searched for a pass that has both images in its constant buffers.
+    struct PhotoUpscale {
+        u32 window_left{};
+        u32 evaluations{};
+        GPUVAddr last_input{};
+        GPUVAddr last_output{};
+        /// The pass that has both images and where in its constant buffer, once found.
+        GPUVAddr output_program{};
+        u32 slot{};
+        u32 input_offset{};
+        u32 output_offset{};
+    } photo_upscale;
 
     /// Motion vectors and depth of Fire Emblem: Fortune's Weave's DLSS evaluation, from its first
     /// pass (run earlier in the frame than the network pass the stand-in replaces), with the input

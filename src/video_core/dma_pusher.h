@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <condition_variable>
@@ -245,6 +246,8 @@ public:
     std::deque<CommandList> dma_pushbuffer; ///< Queue of command lists to be processed
     std::size_t dma_pushbuffer_subindex{};  ///< Index within a command list within the pushbuffer
 
+    static constexpr u32 MacroRegistersStart = 0xe00;
+
     struct DmaState {
         u32 method;            ///< Current method
         u32 subchannel;        ///< Current subchannel
@@ -254,6 +257,16 @@ public:
         u64 dma_word_offset;   ///< Current word offset from address
         bool non_incrementing; ///< Current command's NI flag
         bool is_last_call;
+        bool front_batch; ///< Sampled at the start of an incrementing packet.
+
+        [[nodiscard]] u32 FrontRegisterRunLength(size_t available_words) const {
+            if (!front_batch || method < non_puller_methods || method >= MacroRegistersStart) {
+                return 0;
+            }
+            const auto words = (std::min)({available_words, size_t{method_count},
+                                           size_t{MacroRegistersStart - method}});
+            return words > 1 ? static_cast<u32>(words) : 0;
+        }
     };
 
     Core::System& system;
@@ -270,6 +283,7 @@ public:
         u32 method_count;
         bool non_incrementing;
         bool increment_once;
+        bool front_batch;
         GPUVAddr resume_address; ///< Where the entry that continues the method starts
     };
     void ResolveSplitMethod(GPUVAddr entry_address);

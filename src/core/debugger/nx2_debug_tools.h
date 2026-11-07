@@ -4,6 +4,7 @@
 #pragma once
 
 #include <chrono>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <span>
@@ -30,12 +31,16 @@ class Server;
 struct Endpoint;
 struct ToolState;
 
+/// Read or update the performance experiments. Validate the whole update before changing any
+/// flag; no game clocks or graphics settings are exposed.
+[[nodiscard]] nlohmann::json PerformanceExperiments(const nlohmann::json& params);
+
 /// The debug server of one boot (docs/nx2/debug-mcp.md): started when a game has loaded, stopped
 /// first when it shuts down, so the tools never see a half-built or half-destroyed system.
 class Service {
 public:
     explicit Service(System& system, std::string title, u64 program_id, const Endpoint& endpoint,
-                     std::string dump_directory);
+                     std::filesystem::path dump_directory);
     ~Service();
 
     Service(const Service&) = delete;
@@ -91,7 +96,7 @@ struct InputStep {
 /// The input of the step active at present count now, for steps starting at present count start;
 /// nothing before start and from the end of the last step on.
 [[nodiscard]] std::optional<HID::InjectedInput> InputAt(std::span<const InputStep> steps, u64 start,
-                                                       u64 now);
+                                                        u64 now);
 
 /// The service when EDEN_NX2_DEBUG_SERVER is set and it can listen, otherwise null.
 [[nodiscard]] std::unique_ptr<Service> MaybeStartService(System& system, std::string title,

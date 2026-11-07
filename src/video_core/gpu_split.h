@@ -167,6 +167,10 @@ public:
     /// Waits until the back executed everything sent so far.
     void Drain(DrainSite site = DrainSite::Other);
 
+    /// Waits for queued entries, without waiting for the scheduler's idle hook. This does not
+    /// transfer ownership of the scheduler or caches to the front.
+    bool WaitForEntries(DrainSite site = DrainSite::Other);
+
     /// Compute or copy work was just sent: what can write GPU-written command lists.
     void NoteWriter() {
         last_writer_position = write_position;

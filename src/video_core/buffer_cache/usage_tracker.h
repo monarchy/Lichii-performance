@@ -32,6 +32,10 @@ public:
     }
 
     void Reset() noexcept {
+        if (!tracked) {
+            return;
+        }
+        tracked = false;
         std::ranges::fill(pages, 0ULL);
         recent.fill({~u64{0}, 0});
         full_begin = 0;
@@ -39,6 +43,10 @@ public:
     }
 
     void Track(u64 offset, u64 size) noexcept {
+        const u64 end = offset + size;
+        if (size == 0 || end < offset) {
+            return;
+        }
         // Tracking is idempotent until Reset: skip ranges tracked just before. Draws bind the
         // same (often multi-megabyte) storage buffers again and again, and each Track wrote a
         // word per 4 KiB of the range.
@@ -47,9 +55,10 @@ public:
                 return;
             }
         }
+        tracked = true;
         recent[recent_cursor++ % recent.size()] = {offset, size};
         const size_t page = offset >> BUFFER_PAGE_SHIFT;
-        const size_t page_end = (offset + size) >> BUFFER_PAGE_SHIFT;
+        const size_t page_end = end >> BUFFER_PAGE_SHIFT;
         if (page_end < page || page_end >= pages.size()) {
             return;
         }
@@ -64,13 +73,18 @@ public:
     }
 
     [[nodiscard]] bool IsUsed(u64 offset, u64 size) const noexcept {
+        const u64 end = offset + size;
+        if (size == 0 || end < offset) {
+            return false;
+        }
         const size_t page = offset >> BUFFER_PAGE_SHIFT;
-        const size_t page_end = (offset + size) >> BUFFER_PAGE_SHIFT;
+        const size_t page_end = end >> BUFFER_PAGE_SHIFT;
         if (page_end < page || page_end >= pages.size()) {
             return false;
         }
-        if (IsPageUsed(page, offset, size)) {
-            return true;
+        const bool first_used = IsPageUsed(page, offset, size);
+        if (first_used || page == page_end) {
+            return first_used;
         }
         for (size_t i = page + 1; i < page_end; i++) {
             if (pages[i] != 0) {
@@ -125,17 +139,27 @@ private:
     }
 
     void TrackPage(u64 page, u64 offset, u64 size) noexcept {
+        if (size == 0) {
+            return;
+        }
         const size_t offset_in_page = offset % BUFFER_PAGE_BYTES;
         const size_t first_bit = offset_in_page >> BUFFER_BYTES_PER_BITSHIFT;
-        const size_t num_bits = std::min<size_t>(size, BUFFER_PAGE_BYTES) >> BUFFER_BYTES_PER_BITSHIFT;
+        const size_t bytes = std::min<size_t>(size, BUFFER_PAGE_BYTES - offset_in_page);
+        const size_t last_bit = (offset_in_page + bytes - 1) >> BUFFER_BYTES_PER_BITSHIFT;
+        const size_t num_bits = last_bit - first_bit + 1;
         const size_t mask = ~u64{0} >> (64 - num_bits);
         pages[page] |= (~u64{0} & mask) << first_bit;
     }
 
     bool IsPageUsed(u64 page, u64 offset, u64 size) const noexcept {
+        if (size == 0) {
+            return false;
+        }
         const size_t offset_in_page = offset % BUFFER_PAGE_BYTES;
         const size_t first_bit = offset_in_page >> BUFFER_BYTES_PER_BITSHIFT;
-        const size_t num_bits = std::min<size_t>(size, BUFFER_PAGE_BYTES) >> BUFFER_BYTES_PER_BITSHIFT;
+        const size_t bytes = std::min<size_t>(size, BUFFER_PAGE_BYTES - offset_in_page);
+        const size_t last_bit = (offset_in_page + bytes - 1) >> BUFFER_BYTES_PER_BITSHIFT;
+        const size_t num_bits = last_bit - first_bit + 1;
         const size_t mask = ~u64{0} >> (64 - num_bits);
         const size_t mask2 = (~u64{0} & mask) << first_bit;
         return (pages[page] & mask2) != 0;
@@ -149,6 +173,7 @@ private:
     /// Pages known to be all ones (FillPages).
     size_t full_begin{};
     size_t full_end{};
+    bool tracked{};
 };
 
 } // namespace VideoCommon

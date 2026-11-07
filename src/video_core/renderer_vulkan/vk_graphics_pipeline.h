@@ -180,6 +180,8 @@ public:
     }
 
 private:
+    /// Builds the pipeline once, on whichever thread gets here first.
+
     template <typename Spec>
     bool ConfigureImpl(bool is_indexed);
 

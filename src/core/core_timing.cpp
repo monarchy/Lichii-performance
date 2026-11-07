@@ -9,7 +9,7 @@
 #include <string>
 #include <tuple>
 #include "common/cpu_features.h"
-#include "common/cpu_features.h"
+#include "common/perf_experiments.h"
 
 #ifdef _WIN32
 #include "common/windows/timer_resolution.h"
@@ -86,7 +86,15 @@ void CoreTiming::Initialize(std::function<void()>&& on_thread_init_) {
                         // There are more events left in the queue, wait until the next event.
                         auto const wait_time = *next_time - GetGlobalTimeNs().count();
                         if (wait_time > 0) {
-                            event.WaitFor(std::chrono::nanoseconds(wait_time));
+                            const auto policy =
+#ifdef _WIN32
+                                Common::Nx2Perf::ExperimentEnabled(Common::Nx2Perf::KernelTimedWait)
+                                    ? Common::EventWaitPolicy::KernelTimer
+                                    : Common::EventWaitPolicy::Default;
+#else
+                                Common::EventWaitPolicy::Default;
+#endif
+                            event.WaitFor(std::chrono::nanoseconds{wait_time}, policy);
                         }
                     } else {
                         // Queue is empty, wait until another event is scheduled and signals us to

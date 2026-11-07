@@ -629,6 +629,91 @@ void PollThreadPolicies() {
 #endif
 }
 
+#ifdef _WIN32
+namespace {
+struct ThreadWaitTimer {
+    ThreadWaitTimer() {
+        constexpr DWORD access = TIMER_MODIFY_STATE | SYNCHRONIZE;
+        handle = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, access);
+        if (!handle) {
+            handle = CreateWaitableTimerExW(nullptr, nullptr, 0, access);
+        }
+    }
+    ~ThreadWaitTimer() {
+        if (handle) {
+            CloseHandle(handle);
+        }
+    }
+
+    HANDLE handle{};
+};
+} // Anonymous namespace
+
+Event::~Event() {
+    if (kernel_wake_event) {
+        CloseHandle(kernel_wake_event);
+    }
+}
+
+void Event::WakeKernelWaiters() {
+    SetEvent(kernel_wake_event);
+}
+
+bool Event::WaitForKernel(std::chrono::nanoseconds timeout) {
+    using Clock = std::chrono::steady_clock;
+    using namespace std::chrono;
+    const Clock::time_point deadline{EventWaitDeadline(
+        duration_cast<nanoseconds>(Clock::now().time_since_epoch()), timeout)};
+    std::unique_lock lock{mutex};
+    while (!TryConsumeSignal()) {
+        if (Clock::now() >= deadline) {
+            return false;
+        }
+        // A separate timer for each waiting thread preserves concurrent deadlines.
+        static thread_local ThreadWaitTimer timer;
+        if (!kernel_wake_event) {
+            kernel_wake_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        }
+        auto remaining = deadline - Clock::now();
+        if (remaining <= Clock::duration::zero()) {
+            return false;
+        }
+        // Reset under the predicate lock. A later Set leaves a persistent wake if it
+        // arrives between releasing that lock and entering WaitForMultipleObjects.
+        if (kernel_wake_event && ResetEvent(kernel_wake_event)) {
+            using TimerTicks = duration<s64, std::ratio<1, 10'000'000>>;
+            LARGE_INTEGER due{};
+            due.QuadPart = -ceil<TimerTicks>(remaining).count();
+            const bool armed = timer.handle &&
+                SetWaitableTimerEx(timer.handle, &due, 0, nullptr, nullptr, nullptr, 0);
+            const HANDLE handles[]{kernel_wake_event, timer.handle};
+            const auto timeout_ms = static_cast<DWORD>(
+                (std::min<s64>)(ceil<milliseconds>(remaining).count(), INFINITE - 1));
+            ++kernel_waiters;
+            lock.unlock();
+            const DWORD result = armed ? WaitForMultipleObjects(2, handles, FALSE, INFINITE)
+                                       : WaitForSingleObject(kernel_wake_event, timeout_ms);
+            if (armed) {
+                CancelWaitableTimer(timer.handle);
+            }
+            lock.lock();
+            --kernel_waiters;
+            if (result != WAIT_FAILED) {
+                continue;
+            }
+        }
+        // Bound the fallback duration so a saturated deadline fits the platform CV.
+        remaining = deadline - Clock::now();
+        if (remaining > Clock::duration::zero() &&
+            condvar.wait_for(lock, (std::min)(remaining, duration_cast<Clock::duration>(hours{1})),
+                             [this] { return TryConsumeSignal(); })) {
+            return true;
+        }
+    }
+    return true;
+}
+#endif
+
 #ifdef ARCHITECTURE_x86_64
 // On Linux and UNIX systems, a futex would nominally be used to cover the costs
 // the idea is that it's intuitivelly cheaper to use a direct instruction as opposed to a full futex call
@@ -644,8 +729,11 @@ __attribute__((target("waitpkg,mwaitx")))
 #pragma GCC target("waitpkg")
 #pragma GCC target("mwaitx")
 #endif
-bool Event::WaitFor(const std::chrono::nanoseconds time) {
+bool Event::WaitFor(const std::chrono::nanoseconds time, [[maybe_unused]] EventWaitPolicy policy) {
 #ifdef _WIN32
+    if (policy == EventWaitPolicy::KernelTimer) {
+        return WaitForKernel(time);
+    }
     auto const& caps = Common::g_cpu_caps;
     const auto deadline = EventWaitDeadline(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -706,15 +794,15 @@ bool Event::WaitFor(const std::chrono::nanoseconds time) {
     const auto now = std::chrono::steady_clock::now();
     const auto deadline = std::chrono::steady_clock::time_point{EventWaitDeadline(
         std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()), time)};
-    if (!condvar.wait_until(lk, deadline, [this] { return is_set.load(); }))
-        return false;
-    is_set = false;
-    return true;
+    return condvar.wait_until(lk, deadline, [this] { return TryConsumeSignal(); });
 #endif
 }
 #else
-bool Event::WaitFor(const std::chrono::nanoseconds time) {
+bool Event::WaitFor(const std::chrono::nanoseconds time, [[maybe_unused]] EventWaitPolicy policy) {
 #ifdef _WIN32
+    if (policy == EventWaitPolicy::KernelTimer) {
+        return WaitForKernel(time);
+    }
     auto const end = Common::g_wall_clock.GetTimeNS() + time;
     while (!is_set.load() && end > Common::g_wall_clock.GetTimeNS())
         Common::Windows::SleepForOneTick();
@@ -726,10 +814,7 @@ bool Event::WaitFor(const std::chrono::nanoseconds time) {
     const auto now = std::chrono::steady_clock::now();
     const auto deadline = std::chrono::steady_clock::time_point{EventWaitDeadline(
         std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()), time)};
-    if (!condvar.wait_until(lk, deadline, [this] { return is_set.load(); }))
-        return false;
-    is_set = false;
-    return true;
+    return condvar.wait_until(lk, deadline, [this] { return TryConsumeSignal(); });
 #endif
 }
 #endif

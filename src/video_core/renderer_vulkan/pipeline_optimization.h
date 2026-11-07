@@ -6,6 +6,7 @@
 #include <array>
 
 #include "common/common_types.h"
+#include "common/env_gate.h"
 #include "video_core/vulkan_common/vulkan.h"
 
 namespace Vulkan {

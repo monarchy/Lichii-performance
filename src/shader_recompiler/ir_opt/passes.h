@@ -20,6 +20,8 @@ void ConditionalBarrierPass(IR::Program& program);
 void ConstantPropagationPass(Environment& env, IR::Program& program);
 void DeadCodeEliminationPass(IR::Program& program);
 void GeometryCompactionPass(IR::Program& program, const HostTranslateInfo& host_info);
+/// Maximum storage bindings that the host buffer cache can bind for one shader stage.
+size_t StorageBufferLimit(Stage stage);
 void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
                                      const HostTranslateInfo& host_info);
 void IdentityRemovalPass(IR::Program& program);

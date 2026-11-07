@@ -11,6 +11,7 @@
 #include <functional>
 #include <mutex>
 #include <span>
+#include <vector>
 
 #include <boost/container/small_vector.hpp>
 
@@ -67,6 +68,14 @@ public:
     }
 
     /// Storage images written by the last configured dispatch
+
+    /// Native constant buffer pointer slots taken as storage buffers, and the ones left out
+    /// because they held null when this pipeline was built (rebuilt once one is filled).
+    std::vector<u64> pointer_slots;
+    std::vector<u64> null_pointer_slots;
+    u32 pointer_rebuilds{};
+
+    /// Storage images written by the last configured dispatch, kept while a frame dump runs.
     [[nodiscard]] std::span<const VideoCommon::ImageViewId> WrittenImages() const noexcept {
         return written_images;
     }
@@ -84,6 +93,7 @@ public:
 
     /// Advances the frame window of EDEN_NX2_UPSCALER_TRACE
     static void TickUpscalerTrace();
+
 
 private:
     /// Builds the pipeline once, on whichever thread gets here first.

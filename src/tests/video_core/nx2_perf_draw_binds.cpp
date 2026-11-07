@@ -20,57 +20,51 @@
 
 namespace {
 
-// UsageTracker::Track before the full-page run.
-class OldUsageTracker {
-    static constexpr size_t BUFFER_BYTES_PER_BITSHIFT = 6;
-    static constexpr size_t BUFFER_PAGE_SHIFT = 6 + BUFFER_BYTES_PER_BITSHIFT;
-    static constexpr size_t BUFFER_PAGE_BYTES = 1 << BUFFER_PAGE_SHIFT;
+// Independent interval coverage: no recent-range cache or remembered full-page run.
+class ReferenceUsageTracker {
+    static constexpr u64 PageBytes = 4096;
+    static constexpr u64 GranuleBytes = 64;
 
 public:
-    explicit OldUsageTracker(size_t size) : pages((size >> BUFFER_PAGE_SHIFT) + 1, 0ULL) {}
+    explicit ReferenceUsageTracker(size_t size) : pages(size / PageBytes + 1, 0ULL) {}
 
     void Reset() noexcept {
         std::ranges::fill(pages, 0ULL);
-        recent.fill({~u64{0}, 0});
     }
 
     void Track(u64 offset, u64 size) noexcept {
-        for (const auto& [recent_offset, recent_size] : recent) {
-            if (recent_offset == offset && recent_size == size) {
-                return;
+        const u64 end = offset + size;
+        if (size == 0 || end < offset || end / PageBytes >= pages.size()) {
+            return;
+        }
+        for (u64 page = offset / PageBytes; page <= (end - 1) / PageBytes; ++page) {
+            const u64 page_start = page * PageBytes;
+            const u64 first = ((std::max)(offset, page_start) - page_start) / GranuleBytes;
+            const u64 last = ((std::min)(end, page_start + PageBytes) - page_start - 1) / GranuleBytes;
+            if (first == 0 && last == 63) {
+                pages[page] = ~u64{0};
+            } else {
+                for (u64 bit = first; bit <= last; ++bit) {
+                    pages[page] |= u64{1} << bit;
+                }
             }
         }
-        recent[recent_cursor++ % recent.size()] = {offset, size};
-        const size_t page = offset >> BUFFER_PAGE_SHIFT;
-        const size_t page_end = (offset + size) >> BUFFER_PAGE_SHIFT;
-        if (page_end < page || page_end >= pages.size()) {
-            return;
+    }
+
+    bool IsUsed(u64 offset, u64 size) const noexcept {
+        const u64 end = offset + size;
+        if (size == 0 || end < offset || end / PageBytes >= pages.size()) {
+            return false;
         }
-        TrackPage(page, offset, size);
-        if (page == page_end) {
-            return;
+        for (u64 bit = offset / GranuleBytes; bit <= (end - 1) / GranuleBytes; ++bit) {
+            if ((pages[bit / 64] & (u64{1} << (bit % 64))) != 0) {
+                return true;
+            }
         }
-        for (size_t i = page + 1; i < page_end; i++) {
-            pages[i] = ~u64{0};
-        }
-        const size_t offset_end = offset + size;
-        const size_t offset_end_page_aligned = Common::AlignDown(offset_end, BUFFER_PAGE_BYTES);
-        TrackPage(page_end, offset_end_page_aligned, offset_end - offset_end_page_aligned);
+        return false;
     }
 
     std::vector<u64> pages;
-
-private:
-    void TrackPage(u64 page, u64 offset, u64 size) noexcept {
-        const size_t offset_in_page = offset % BUFFER_PAGE_BYTES;
-        const size_t first_bit = offset_in_page >> BUFFER_BYTES_PER_BITSHIFT;
-        const size_t num_bits = std::min<size_t>(size, BUFFER_PAGE_BYTES) >> BUFFER_BYTES_PER_BITSHIFT;
-        const size_t mask = ~u64{0} >> (64 - num_bits);
-        pages[page] |= (~u64{0} & mask) << first_bit;
-    }
-
-    std::array<std::pair<u64, u64>, 4> recent{{{~u64{0}, 0}, {~u64{0}, 0}, {~u64{0}, 0}, {~u64{0}, 0}}};
-    size_t recent_cursor{};
 };
 
 class FakeRasterizer {
@@ -151,7 +145,7 @@ TEST_CASE("Nx2Perf draw-binds: usage survives slot relocation and reset", "[vide
     REQUIRE(std::ranges::equal(slots[id].Pages(), before));
     slots[id].Reset();
     REQUIRE(std::ranges::all_of(slots[id].Pages(), [](u64 word) { return word == 0; }));
-    OldUsageTracker old{size};
+    ReferenceUsageTracker old{size};
     for (u64 i = 0; i < 8; ++i) {
         slots[id].Track(i * PAGE, 2 * WORD + 64);
         old.Track(i * PAGE, 2 * WORD + 64);
@@ -194,11 +188,11 @@ TEST_CASE("Nx2Perf draw-binds: clean words survive manager pool growth", "[video
     REQUIRE(DirtyUpload(*dirty, BASE, 65 * MANAGER).empty());
 }
 
-TEST_CASE("Nx2Perf draw-binds: UsageTracker run matches the old Track", "[video_core]") {
+TEST_CASE("Nx2Perf draw-binds: UsageTracker run matches independent byte coverage", "[video_core]") {
     constexpr u64 buffer_size = 24ULL << 20;
     std::mt19937_64 rng{0x0400486024DEC000ULL};
     VideoCommon::UsageTracker tracker{buffer_size};
-    OldUsageTracker old{buffer_size};
+    ReferenceUsageTracker old{buffer_size};
     const auto random_range = [&]() -> std::pair<u64, u64> {
         static constexpr u64 sizes[] = {16, 64, 100, 256, 4096, 6000, 65536, 1ULL << 20, 8ULL << 20};
         const u64 size = sizes[rng() % std::size(sizes)] + (rng() % 2 == 0 ? 0 : rng() % 8192);
@@ -228,6 +222,57 @@ TEST_CASE("Nx2Perf draw-binds: UsageTracker run matches the old Track", "[video_
         }
     }
     REQUIRE(std::ranges::equal(tracker.Pages(), old.pages));
+}
+
+TEST_CASE("UsageTracker covers partial granules and refuses wrapped ranges", "[video_core][usage_tracker]") {
+    constexpr u64 page = 4096;
+    VideoCommon::UsageTracker tracker{2 * page};
+    tracker.Track(63, 2);
+    REQUIRE(tracker.Pages()[0] == 3);
+    CHECK(tracker.IsUsed(0, 1));
+    CHECK(tracker.IsUsed(127, 1));
+    CHECK_FALSE(tracker.IsUsed(128, 1));
+    tracker.Reset();
+    tracker.Track(page - 1, 2);
+    REQUIRE(tracker.Pages()[0] == (u64{1} << 63));
+    REQUIRE(tracker.Pages()[1] == 1);
+    CHECK(tracker.IsUsed(page + 63, 1));
+    CHECK_FALSE(tracker.IsUsed(page + 64, 1));
+    const std::vector<u64> before{tracker.Pages().begin(), tracker.Pages().end()};
+    for (const auto& [offset, size] : {std::pair<u64, u64>{0, 0}, {page + 1, ~u64{0}},
+                                      {~u64{0} - 31, 64}, {4 * page, 64}}) {
+        CAPTURE(offset, size);
+        tracker.Track(offset, size);
+        CHECK(std::ranges::equal(tracker.Pages(), before));
+        CHECK_FALSE(tracker.IsUsed(offset, size));
+    }
+    tracker.Reset();
+    CHECK(std::ranges::all_of(tracker.Pages(), [](u64 bits) { return bits == 0; }));
+}
+
+TEST_CASE("UsageTracker queries match independent granule occupancy", "[video_core][usage_tracker]") {
+    constexpr u64 size = 16 * 4096;
+    VideoCommon::UsageTracker tracker{size};
+    ReferenceUsageTracker reference{size};
+    std::mt19937_64 random{0x0400486024DEC001ULL};
+    for (u32 step = 0; step < 20000; ++step) {
+        if (step % 89 == 0) {
+            tracker.Reset();
+            reference.Reset();
+        }
+        if (step % 3 == 0) {
+            const u64 offset = random() % size;
+            const u64 bytes = random() % 8193;
+            tracker.Track(offset, bytes);
+            reference.Track(offset, bytes);
+        }
+        for (u32 query = 0; query < 4; ++query) {
+            const u64 offset = random() % size;
+            const u64 bytes = random() % 8193;
+            CAPTURE(step, offset, bytes);
+            REQUIRE(tracker.IsUsed(offset, bytes) == reference.IsUsed(offset, bytes));
+        }
+    }
 }
 
 TEST_CASE("Nx2Perf draw-binds: clean words", "[video_core]") {

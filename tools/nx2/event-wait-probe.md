@@ -7,6 +7,8 @@ built on Windows x86-64 when `YUZU_TESTS=ON`:
 cmake --build <build> --target event_wait_probe --parallel 12
 <build>/bin/event_wait_probe.exe > waits-default.csv
 <build>/bin/event_wait_probe.exe --maximum-resolution > waits-500us.csv
+<build>/bin/event_wait_probe.exe --kernel-timer > waits-kernel.csv
+<build>/bin/event_wait_probe.exe --kernel-timer --maximum-resolution > waits-kernel-500us.csv
 ```
 
 The second command requests the same maximum Windows timer resolution as the
@@ -33,3 +35,11 @@ retains MWAITX and retries nonsignalled wakes against a fixed deadline. Addition
 tests cover deterministic deadline/budget arithmetic, reset-induced wakes and
 extreme timeouts. Untimed `Event::Wait` remains the indefinite-wait API; negative
 `WaitFor` durations are not an infinite-wait sentinel.
+
+The experimental CPU branch additionally exposes a Windows kernel-timer policy, based on that
+PR, for controlled comparison. Default waits retain their hardware policy. Only opt-in timed
+HostTiming waits select kernel timers; the probe and unit tests can select either policy
+directly. Timers are local to each waiter thread; the Event wake handle and predicate are
+coordinated under the same mutex. Kernel wake calls are skipped while no kernel waiter exists.
+Compare deadline lateness and missed signals as well as FPS. Scheduled CPU accounting while
+inside MWAITX is not proof of active execution or a game-frame-rate cost.

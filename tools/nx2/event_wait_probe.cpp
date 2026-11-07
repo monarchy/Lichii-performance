@@ -23,21 +23,31 @@ long long Qpc() {
 } // namespace
 
 int main(int argc, char** argv) {
-    if (argc > 2 || (argc == 2 && std::string_view{argv[1]} != "--maximum-resolution")) {
-        std::fputs("Usage: event_wait_probe [--maximum-resolution]\n", stderr);
-        return 2;
+    bool maximum_resolution{};
+    auto policy = Common::EventWaitPolicy::Default;
+    for (int i = 1; i < argc; ++i) {
+        const std::string_view option{argv[i]};
+        if (option == "--kernel-timer") {
+            policy = Common::EventWaitPolicy::KernelTimer;
+        } else if (option == "--maximum-resolution") {
+            maximum_resolution = true;
+        } else {
+            std::fputs("Usage: event_wait_probe [--kernel-timer] [--maximum-resolution]\n", stderr);
+            return 2;
+        }
     }
-    if (argc == 2) {
+    if (maximum_resolution) {
         Common::Windows::SetCurrentTimerResolutionToMaximum();
     }
     LARGE_INTEGER frequency;
     QueryPerformanceFrequency(&frequency);
     const auto ns = [&](long long ticks) { return ticks * 1'000'000'000LL / frequency.QuadPart; };
-    std::printf("commit=%s qpc_hz=%lld tsc_hz=%llu monitorx=%d waitpkg=%d timer_resolution_ns=%lld\n",
+    std::printf("commit=%s qpc_hz=%lld tsc_hz=%llu monitorx=%d waitpkg=%d timer_resolution_ns=%lld wait_policy=%s\n",
                 Common::g_scm_rev, frequency.QuadPart,
                 static_cast<unsigned long long>(Common::g_cpu_caps.tsc_frequency),
                 Common::g_cpu_caps.monitorx, Common::g_cpu_caps.waitpkg,
-                static_cast<long long>(Common::Windows::GetCurrentTimerResolution().count()));
+                static_cast<long long>(Common::Windows::GetCurrentTimerResolution().count()),
+                policy == Common::EventWaitPolicy::KernelTimer ? "kernel" : "default");
     std::puts("trial,requested_ns,requested_signal_delay_ns,wait_elapsed_ns,signal_call_ns,signal_done_ns,result,is_set_at_return,is_set_after_join");
     unsigned failures{};
     for (int trial = 0; trial < 30; ++trial) {
@@ -53,7 +63,7 @@ int main(int argc, char** argv) {
         });
         ready.count_down();
         const auto begin = Qpc();
-        const bool result = event.WaitFor(std::chrono::seconds{2});
+        const bool result = event.WaitFor(std::chrono::seconds{2}, policy);
         const auto end = Qpc();
         const bool state = event.IsSet();
         setter.join();
@@ -67,7 +77,7 @@ int main(int argc, char** argv) {
         for (int trial = 0; trial < 5; ++trial) {
             Common::Event event;
             const auto begin = Qpc();
-            const bool result = event.WaitFor(std::chrono::nanoseconds{timeout});
+            const bool result = event.WaitFor(std::chrono::nanoseconds{timeout}, policy);
             const auto elapsed = ns(Qpc() - begin);
             std::printf("%d,%lld,-1,%lld,-1,-1,%d,%d,%d\n", trial, timeout, elapsed,
                         result, event.IsSet(), event.IsSet());

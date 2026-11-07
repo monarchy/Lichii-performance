@@ -12,6 +12,7 @@
 #include <type_traits>
 
 #include "common/common_types.h"
+#include "video_core/nx2_perf_experiments.h"
 
 namespace VideoCommon {
 
@@ -38,6 +39,10 @@ concept StreamUniformReusable = requires(R& runtime, u32 size) {
         return value == nullptr || value[0] != '0';
     }();
     return enabled;
+}
+
+[[nodiscard]] inline bool UniformStreamDirectEnabled() noexcept {
+    return Nx2Perf::ExperimentEnabled(Nx2Perf::UniformDirect);
 }
 
 template <class Ref>
@@ -89,7 +94,8 @@ inline void ResetUniformStreamReuse() noexcept {
 template <class Runtime, class DeviceMemory>
 [[nodiscard]] bool BindSmallUniformReusing(Runtime& runtime, DeviceMemory& device_memory,
                                            size_t stage, u32 index, u32 binding_index,
-                                           u64 device_addr, u32 size) {
+                                           u64 device_addr, u32 size,
+                                           bool direct = UniformStreamDirectEnabled()) {
     using Reuse = UniformStreamReuse<typename Runtime::StreamUniformRef>;
     if (size == 0 || size > Reuse::MaxBytes || stage >= Reuse::NumStages ||
         index >= Reuse::NumSlots) {
@@ -97,24 +103,31 @@ template <class Runtime, class DeviceMemory>
     }
     Reuse& reuse = UniformStreamReuseState<typename Runtime::StreamUniformRef>();
     typename Reuse::Slot& slot = reuse.slots[stage][index];
-    u8* const scratch = reuse.scratch.data();
-    device_memory.ReadBlockUnsafe(device_addr, scratch, size);
+    // Adapted from Eglantine PR #503: compare contiguous guest bytes without a scratch copy.
+    const u8* bytes = direct ? device_memory.GetSpan(device_addr, size) : nullptr;
+    if (bytes == nullptr) {
+        u8* const scratch = reuse.scratch.data();
+        device_memory.ReadBlockUnsafe(device_addr, scratch, size);
+        bytes = scratch;
+    }
 
     const bool same_bytes =
-        slot.size == size && std::memcmp(slot.bytes.data(), scratch, size) == 0;
+        slot.size == size && std::memcmp(slot.bytes.data(), bytes, size) == 0;
     if (same_bytes && slot.tick == runtime.CurrentTick()) {
         runtime.RebindStreamUniform(slot.ref, size);
         return true;
     }
+    if (!same_bytes) {
+        // Take one snapshot before allocating: a concurrent guest write must not leave the
+        // stream allocation different from the bytes remembered for its next reuse check.
+        slot.size = size;
+        std::memcpy(slot.bytes.data(), bytes, size);
+    }
     const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
-    std::memcpy(span.data(), scratch, size);
+    std::memcpy(span.data(), slot.bytes.data(), size);
     slot.ref = runtime.LastStreamUniformRef();
     // After the allocation: the tick the stream region is tagged with is the one current now.
     slot.tick = runtime.CurrentTick();
-    if (!same_bytes) {
-        slot.size = size;
-        std::memcpy(slot.bytes.data(), scratch, size);
-    }
     return true;
 }
 

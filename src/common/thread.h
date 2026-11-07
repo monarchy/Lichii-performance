@@ -18,31 +18,37 @@
 
 namespace Common {
 
+enum class EventWaitPolicy { Default, KernelTimer };
+
 class Event {
 public:
+#ifdef _WIN32
+    ~Event();
+#endif
     void Set() {
         std::scoped_lock lk{mutex};
         if (!is_set) {
             is_set = true;
             condvar.notify_one();
+#ifdef _WIN32
+            if (kernel_waiters != 0) {
+                WakeKernelWaiters();
+            }
+#endif
         }
     }
 
     void Wait() {
         std::unique_lock lk{mutex};
-        condvar.wait(lk, [&] { return is_set.load(); });
-        is_set = false;
+        condvar.wait(lk, [this] { return TryConsumeSignal(); });
     }
 
-    bool WaitFor(const std::chrono::nanoseconds time);
+    bool WaitFor(std::chrono::nanoseconds time, EventWaitPolicy policy = EventWaitPolicy::Default);
 
     template<class Clock, class Duration>
     bool WaitUntil(const std::chrono::time_point<Clock, Duration> time) {
         std::unique_lock lk{mutex};
-        if (!condvar.wait_until(lk, time, [this] { return is_set.load(); }))
-            return false;
-        is_set = false;
-        return true;
+        return condvar.wait_until(lk, time, [this] { return TryConsumeSignal(); });
     }
 
     void Reset() {
@@ -57,9 +63,21 @@ public:
     }
 
 private:
+    // Hardware waits may consume a Set without acquiring mutex.
+    bool TryConsumeSignal() {
+        return is_set.load(std::memory_order_acquire) &&
+               is_set.exchange(false, std::memory_order_acq_rel);
+    }
+
     alignas(64) std::atomic<bool> is_set{false};
     std::condition_variable condvar;
     std::mutex mutex;
+#ifdef _WIN32
+    bool WaitForKernel(std::chrono::nanoseconds timeout);
+    void WakeKernelWaiters();
+    void* kernel_wake_event{}; ///< Manual-reset event, protected by mutex.
+    unsigned kernel_waiters{};
+#endif
 };
 
 class Barrier {

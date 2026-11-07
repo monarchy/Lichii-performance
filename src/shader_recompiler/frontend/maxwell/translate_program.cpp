@@ -119,6 +119,7 @@ void AddNVNStorageBuffers(IR::Program& program) {
         throw InvalidArgument("Invalid stage {}", program.stage);
     }()};
     auto& descs{program.info.storage_buffers_descriptors};
+    const size_t max_ssbos = Optimization::StorageBufferLimit(program.stage);
     for (u32 index = 0; index < num_buffers; ++index) {
         if (!program.info.nvn_buffer_used[index]) {
             continue;
@@ -130,6 +131,10 @@ void AddNVNStorageBuffers(IR::Program& program) {
         if (it != descs.end()) {
             it->is_written |= program.info.stores_global_memory;
             continue;
+        }
+        if (descs.size() >= max_ssbos) {
+            throw NotImplementedException("NVN storage buffer fallback exceeds {} bindings",
+                                          max_ssbos);
         }
         descs.push_back({
             .cbuf_index = driver_cbuf,

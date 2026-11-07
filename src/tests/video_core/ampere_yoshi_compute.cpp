@@ -55,7 +55,7 @@ TEST_CASE("Ampere IMNMX retains its signed twenty-bit immediate encoding", "[amp
 }
 
 TEST_CASE("Yoshi captured SURED uses a buffer coordinate and descriptor", "[ampere][yoshi]") {
-    for (const u32 dimension : {1U, 3U}) {
+    for (const u32 dimension : {1U, 3U, 5U}) {
         for (const u32 guard : {0U, 7U, 9U}) {
             auto instruction = Reduction;
             instruction.words[0] = (instruction.words[0] & ~0xf000U) | (guard << 12);
@@ -69,7 +69,7 @@ TEST_CASE("Yoshi captured SURED uses a buffer coordinate and descriptor", "[ampe
                   (0xeb48002000000506ULL | (u64{guard} << 16) | (u64{dimension} << 33)));
         }
     }
-    for (const u32 dimension : {0U, 2U, 4U, 5U, 6U, 7U}) {
+    for (const u32 dimension : {0U, 2U, 4U, 6U, 7U}) {
         auto instruction = Reduction;
         instruction.words[1] = (instruction.words[1] & 0x1fffffffU) | (dimension << 29);
         REQUIRE_FALSE(LowerToMaxwell(std::array{instruction, Exit}));

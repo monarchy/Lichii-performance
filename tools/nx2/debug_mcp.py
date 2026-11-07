@@ -175,6 +175,23 @@ TOOLS = [
         },
     },
     {
+        "name": "write_memory",
+        "description": "For experiments only: writes 1 to 4096 bytes of the game's guest memory "
+                       "and returns what was there before. Refused unless the emulator was "
+                       "started with EDEN_NX2_DEBUG_WRITE=1 (status shows write_memory). Give "
+                       "'hex' (byte pairs in memory order) or 'f32' (floats, little endian). "
+                       "Restore the 'before' bytes when done.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "address": {"type": ["string", "integer"]},
+                "hex": {"type": "string"},
+                "f32": {"type": "array", "items": {"type": "number"}},
+            },
+            "required": ["address"],
+        },
+    },
+    {
         "name": "read_gpu_memory",
         "description": "Reads up to 64 KiB of GPU virtual memory (e.g. query report and semaphore "
                        "buffers the game reads back) at the next frame end, as the GPU sees it, "
@@ -427,7 +444,8 @@ def call_once(adapter, request_text, out, stdout):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--server", default=os.environ.get("LICHII_DEBUG_SERVER", DEFAULT_SERVER),
+    parser.add_argument("--server", default=os.environ.get("LICHII_DEBUG_SERVER",
+                        os.environ.get("EDEN_NX2_DEBUG_SERVER", DEFAULT_SERVER)),
                         help=f"host:port of EDEN_NX2_DEBUG_SERVER (default {DEFAULT_SERVER})")
     parser.add_argument("--call", metavar="JSON",
                         help='run one request and exit, e.g. \'{"method":"screenshot","params":{}}\'')
