@@ -95,3 +95,23 @@ and a fresh same-quality game comparison.
 The compiler techniques are described in the official [Clang ThinLTO documentation](https://clang.llvm.org/docs/ThinLTO.html)
 and [profile-guided optimization manual](https://clang.llvm.org/docs/UsersManual.html#profile-guided-optimization).
 No fast-math option is part of this plan.
+
+## Native ThinLTO screen completed later that day
+
+Local source `c17a6f5113` (GUI SHA-256 `c1ddf4c8097e2a671ef4d78f95ad70d49e14321d0943b25f2f822cecd88ba165`), same graphics listed above and own-frame fence waits. The private profile used no physical controller bindings; debug input loaded the copied save and positioned the camera. One process, 15 seconds settling plus 20 seconds measurement per phase.
+
+| Phase | Entry + direct UBO + packet batch | Kernel timer | FPS |
+|---|---:|---:|---:|
+| base-1 | Off | Off | 40.495 |
+| kernel-1 | Off | On | 39.156 |
+| base-2 | Off | Off | 40.665 |
+| gpu-all-1 | On | Off | 41.916 |
+| all-1 | On | On | 39.919 |
+| gpu-all-2 | On | Off | 41.546 |
+| base-3 | Off | Off | 40.495 |
+
+Aggregate baseline: 40.552 FPS. Aggregate three-command-path phases: 41.731 FPS (+2.91% observed). The kernel timer was slower in this screen, including with the other three changes. All switches were restored off. **60 FPS remains unachieved.** No whole-game minimum, statistical significance or cross-build speedup is established by these short, unrandomized samples. The stationary camera differs slightly from older processes, so percentages are not added across rounds.
+
+Both test GUI runs closed normally and flushed native frame-history CSV. That file has no phase timestamps, so no heavy-phase p99 or 1% low is claimed. Original saves were unchanged.
+
+Validation of this native source: 823 C++ cases, including the 808-case main suite in both lexical and the previously used seeded order; 31 CLI tests; 25 Python parser/archive/container/static tests; four captured regression fixtures validated with SPIR-V tools; maximum-resolution deadline probes with both default and kernel-timer backends. All passed. A profile-trained release build has not yet been measured. Instrumentation FPS will not be used as a release baseline.
