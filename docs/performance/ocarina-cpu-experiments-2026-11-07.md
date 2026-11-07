@@ -88,7 +88,7 @@ guest relaunches externally. With the variable absent, normal operation has no r
 The generic build used in the short screen has LTO off. The next local candidate uses
 `-march=native -ffp-contract=off` and ThinLTO, with one linker and two LTO workers to bound memory.
 It is specific to the test PC's exposed CPU capabilities. Local compiler probes also verified
-instrumentation/profile-use support. No profile-trained emulator build has yet been measured.
+instrumentation/profile-use support. The subsequent [PGO-use comparison](ocarina-pgo-2026-11-07.md) has now been measured; stable 60 FPS remains unachieved.
 Compiler capability is **not** a measured game speedup; the candidate needs correctness tests
 and a fresh same-quality game comparison.
 
@@ -114,4 +114,4 @@ Aggregate baseline: 40.552 FPS. Aggregate three-command-path phases: 41.731 FPS 
 
 Both test GUI runs closed normally and flushed native frame-history CSV. That file has no phase timestamps, so no heavy-phase p99 or 1% low is claimed. Original saves were unchanged.
 
-Validation of this native source: 823 C++ cases, including the 808-case main suite in both lexical and the previously used seeded order; 31 CLI tests; 25 Python parser/archive/container/static tests; four captured regression fixtures validated with SPIR-V tools; maximum-resolution deadline probes with both default and kernel-timer backends. All passed. A profile-trained release build has not yet been measured. Instrumentation FPS will not be used as a release baseline.
+Validation of this native source: 823 C++ cases, including the 808-case main suite in both lexical and the previously used seeded order; 31 CLI tests; 25 Python parser/archive/container/static tests; four captured regression fixtures validated with SPIR-V tools; maximum-resolution deadline probes with both default and kernel-timer backends. All passed. The subsequent [PGO-use comparison](ocarina-pgo-2026-11-07.md) records preliminary measurements. Instrumentation FPS is not a release baseline.
